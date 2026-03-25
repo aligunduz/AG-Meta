@@ -64,7 +64,13 @@ def main(config):
       use_alignment_post_loss
   )
 
-  use_gradient_transport = config.get('use_gradient_transport', False)
+  transport_mode = config.get('transport_mode', 'none')
+  low_rank_rank = int(config.get('low_rank_rank', 4))
+  low_rank_init_scale = float(config.get('low_rank_init_scale', 1e-3))
+
+  valid_transport_modes = ['none', 'scalar_gate', 'low_rank']
+  if transport_mode not in valid_transport_modes:
+      raise ValueError(f"Unknown transport_mode: {transport_mode}")
   ##### Dataset #####
 
   # meta-train
@@ -85,7 +91,7 @@ def main(config):
     val_loader = DataLoader(
       val_set, config['val']['n_episode'],
       collate_fn=datasets.collate_fn, num_workers=4, pin_memory=True,prefetch_factor=4,persistent_workers=True)
-  
+
   ##### Model and Optimizer #####
 
   inner_args = utils.config_inner_args(config.get('inner_args'))
@@ -95,7 +101,16 @@ def main(config):
     config['encoder_args'] = ckpt['encoder_args']
     config['classifier'] = ckpt['classifier']
     config['classifier_args'] = ckpt['classifier_args']
-    model = models.load(ckpt, load_clf=(not inner_args['reset_classifier']))
+    transport_mode = ckpt.get('transport_mode', transport_mode)
+    low_rank_rank = int(ckpt.get('low_rank_rank', low_rank_rank))
+    low_rank_init_scale = float(ckpt.get('low_rank_init_scale', low_rank_init_scale))
+    model = models.load(
+        ckpt,
+        load_clf=(not inner_args['reset_classifier']),
+        transport_mode=transport_mode,
+        low_rank_rank=low_rank_rank,
+        low_rank_init_scale=low_rank_init_scale
+    )
     optimizer, lr_scheduler = optimizers.load(ckpt, model.parameters())
     start_epoch = ckpt['training']['epoch'] + 1
     max_va = ckpt['training']['max_va']
@@ -104,8 +119,15 @@ def main(config):
     config['classifier_args'] = config.get('classifier_args') or dict()
     config['encoder_args']['bn_args']['n_episode'] = config['train']['n_episode']
     config['classifier_args']['n_way'] = config['train']['n_way']
-    model = models.make(config['encoder'], config['encoder_args'],
-                        config['classifier'], config['classifier_args'])
+    model = models.make(
+        config['encoder'],
+        config['encoder_args'],
+        config['classifier'],
+        config['classifier_args'],
+        transport_mode=transport_mode,
+        low_rank_rank=low_rank_rank,
+        low_rank_init_scale=low_rank_init_scale
+    )
     optimizer, lr_scheduler = optimizers.make(
       config['optimizer'], model.parameters(), **config['optimizer_args'])
     start_epoch = 1
@@ -122,7 +144,7 @@ def main(config):
 
   scaler = amp.GradScaler('cuda')  # NEW (AMP scaler)
   ##### Training and evaluation #####
-    
+
   # 'tl': meta-train loss
   # 'ta': meta-train accuracy
   # 'vl': meta-val loss
@@ -175,7 +197,9 @@ def main(config):
                   use_alignment_post_loss=use_alignment_post_loss,
                   alignment_pre_weight=alignment_pre_weight,
                   alignment_post_weight=alignment_post_weight,
-                  use_gradient_transport=use_gradient_transport
+                  transport_mode=transport_mode,
+                  low_rank_rank=low_rank_rank,
+                  low_rank_init_scale=low_rank_init_scale
               )
           else:
               logits = model(
@@ -184,7 +208,9 @@ def main(config):
                   y_shot,
                   inner_args,
                   meta_train=True,
-                  use_gradient_transport=use_gradient_transport
+                  transport_mode=transport_mode,
+                  low_rank_rank=low_rank_rank,
+                  low_rank_init_scale=low_rank_init_scale
               )
               metrics = None
           if log_alignment and metrics is not None:
@@ -233,7 +259,7 @@ def main(config):
 
       aves['tl'].update(loss.item(), 1)
       aves['ta'].update(acc, 1)
-      
+
 
     # meta-val
     if eval_val:
@@ -252,7 +278,9 @@ def main(config):
             model.reset_classifier()
 
         with torch.no_grad(), amp.autocast('cuda'):  # NEW (val’de de AMP aç)
-            logits = model(x_shot, x_query, y_shot, inner_args, meta_train=False, use_gradient_transport=use_gradient_transport)
+            logits = model(x_shot, x_query, y_shot, inner_args, meta_train=False, transport_mode=transport_mode,
+    low_rank_rank=low_rank_rank,
+    low_rank_init_scale=low_rank_init_scale)
             logits = logits.flatten(0, 1)
             labels = y_query.flatten()
 
@@ -269,27 +297,15 @@ def main(config):
       aves[k] = avg.item()
       trlog[k].append(aves[k])
 
-    gate_mean = None
-    if use_gradient_transport:
-        model_for_log = model.module if config.get('_parallel') else model
-        gates = model_for_log.get_gradient_transport_gates()
-        gate_mean = sum(gates.values()) / len(gates)
-
-        writer.add_scalar('gradient_transport/gate_mean', gate_mean, epoch)
-
-        for gate_name, gate_value in gates.items():
-            writer.add_scalar(f'gradient_transport/{gate_name}', gate_value, epoch)
 
     t_epoch = utils.time_str(timer_epoch.end())
     t_elapsed = utils.time_str(timer_elapsed.end())
-    t_estimate = utils.time_str(timer_elapsed.end() / 
+    t_estimate = utils.time_str(timer_elapsed.end() /
       (epoch - start_epoch + 1) * (config['epoch'] - start_epoch + 1))
 
     # formats output
     log_str = 'epoch {}, meta-train {:.4f}|{:.4f}'.format(
       str(epoch), aves['tl'], aves['ta'])
-    if use_gradient_transport and gate_mean is not None:
-        log_str += ', gate_mean {:.4f}'.format(gate_mean)
     writer.add_scalars('loss', {'meta-train': aves['tl']}, epoch)
     writer.add_scalars('acc', {'meta-train': aves['ta']}, epoch)
     if log_alignment:
@@ -319,7 +335,7 @@ def main(config):
       'optimizer': config['optimizer'],
       'optimizer_args': config['optimizer_args'],
       'optimizer_state_dict': optimizer.state_dict(),
-      'lr_scheduler_state_dict': lr_scheduler.state_dict() 
+      'lr_scheduler_state_dict': lr_scheduler.state_dict()
         if lr_scheduler is not None else None,
     }
     ckpt = {
@@ -333,8 +349,16 @@ def main(config):
       'classifier': config['classifier'],
       'classifier_args': config['classifier_args'],
       'classifier_state_dict': model_.classifier.state_dict(),
-      'gradient_transport_state_dict': model_.gradient_transport_logits.state_dict(),
+
+      'transport_mode': transport_mode,
+      'low_rank_rank': low_rank_rank,
+      'low_rank_init_scale': low_rank_init_scale,
+      'scalar_transport_logits_state_dict': model_.scalar_transport_logits.state_dict(),
+      'low_rank_U_state_dict': model_.low_rank_U.state_dict(),
+      'low_rank_V_state_dict': model_.low_rank_V.state_dict(),
+
       'training': training,
+
     }
 
     # 'epoch-last.pth': saved at the latest epoch

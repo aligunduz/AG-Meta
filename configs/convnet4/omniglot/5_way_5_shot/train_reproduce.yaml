@@ -38,10 +38,13 @@ inner_args:
 optimizer: adam
 optimizer_args:
   lr: 0.001
-log_alignment: true
+log_alignment: false
 use_alignment_pre_loss: false
 use_alignment_post_loss: false
 alignment_pre_weight: 0.1
 alignment_post_weight: 0.1
-use_gradient_transport: false
+#use_gradient_transport: false
+transport_mode: "none"      # none | scalar_gate | low_rank
+low_rank_rank: 4
+low_rank_init_scale: 1e-3
 epoch: 100

@@ -11,7 +11,9 @@ from . import classifiers
 from .modules import get_child_dict, Module, BatchNorm2d
 
 
-def make(enc_name, enc_args, clf_name, clf_args):
+def make(enc_name, enc_args, clf_name, clf_args,transport_mode='none',
+    low_rank_rank=4,
+    low_rank_init_scale=1e-3):
   """
   Initializes a random meta model.
 
@@ -27,11 +29,18 @@ def make(enc_name, enc_args, clf_name, clf_args):
   enc = encoders.make(enc_name, **enc_args)
   clf_args['in_dim'] = enc.get_out_dim()
   clf = classifiers.make(clf_name, **clf_args)
-  model = MAML(enc, clf)
+  model = MAML(
+      enc, clf,
+      transport_mode=transport_mode,
+      low_rank_rank=low_rank_rank,
+      low_rank_init_scale=low_rank_init_scale
+  )
   return model
 
 
-def load(ckpt, load_clf=False, clf_name=None, clf_args=None):
+def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode='none',
+    low_rank_rank=4,
+    low_rank_init_scale=1e-3):
   """
   Initializes a meta model with a pre-trained encoder.
 
@@ -55,47 +64,118 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None):
     else:
       clf_args['in_dim'] = enc.get_out_dim()
       clf = classifiers.make(clf_name, **clf_args)
-  model = MAML(enc, clf)
-  if 'gradient_transport_state_dict' in ckpt:
-      model.gradient_transport_logits.load_state_dict(
-          ckpt['gradient_transport_state_dict']
+  model = MAML(
+      enc, clf,
+      transport_mode=transport_mode,
+      low_rank_rank=low_rank_rank,
+      low_rank_init_scale=low_rank_init_scale
+  )
+  if 'scalar_transport_logits_state_dict' in ckpt:
+      model.scalar_transport_logits.load_state_dict(
+          ckpt['scalar_transport_logits_state_dict']
+      )
+
+  if 'low_rank_U_state_dict' in ckpt:
+      model.low_rank_U.load_state_dict(
+          ckpt['low_rank_U_state_dict']
+      )
+
+  if 'low_rank_V_state_dict' in ckpt:
+      model.low_rank_V.load_state_dict(
+          ckpt['low_rank_V_state_dict']
       )
   return model
 
 
 class MAML(Module):
-  def __init__(self, encoder, classifier):
+  def __init__(self, encoder, classifier,transport_mode='none',
+    low_rank_rank=4,
+    low_rank_init_scale=1e-3):
     super(MAML, self).__init__()
     self.encoder = encoder
     self.classifier = classifier
-    # Her katman için 1 öğrenilebilir gate logit'i
-    self.gradient_transport_logits = nn.ParameterDict()
 
-    # Encoder katmanları
-    for name, _ in self.encoder.named_parameters():
-      key = 'encoder__' + name.replace('.', '__')
-      self.gradient_transport_logits[key] = nn.Parameter(torch.tensor(4.0))
+    self.transport_mode = transport_mode
+    self.low_rank_rank = int(low_rank_rank)
+    self.low_rank_init_scale = float(low_rank_init_scale)
 
-    # Classifier katmanları
-    for name, _ in self.classifier.named_parameters():
-      key = 'classifier__' + name.replace('.', '__')
-      self.gradient_transport_logits[key] = nn.Parameter(torch.tensor(4.0))
+    self.scalar_transport_logits = nn.ParameterDict()
+    self.low_rank_U = nn.ParameterDict()
+    self.low_rank_V = nn.ParameterDict()
+    self._build_transport_params()
 
   def reset_classifier(self):
     self.classifier.reset_parameters()
 
-  def get_gradient_transport_gates(self):
-      out = {}
-      for key, logit in self.gradient_transport_logits.items():
-          out[key] = torch.sigmoid(logit).detach().item()
-      return out
+  def _build_transport_params(self):
+      for prefix, module in [('encoder', self.encoder), ('classifier', self.classifier)]:
+          for name, param in module.named_parameters():
+              key = self._transport_key(f'{prefix}.{name}')
+
+              self.scalar_transport_logits[key] = nn.Parameter(
+                  torch.tensor(4.0, device=param.device, dtype=param.dtype)
+              )
+
+              n = param.numel()
+              r = min(self.low_rank_rank, n)
+
+              self.low_rank_U[key] = nn.Parameter(
+                  torch.randn(n, r, device=param.device, dtype=param.dtype) * self.low_rank_init_scale
+              )
+              self.low_rank_V[key] = nn.Parameter(
+                  torch.randn(n, r, device=param.device, dtype=param.dtype) * self.low_rank_init_scale
+              )
+
+  def _transport_key(self, name):
+      return name.replace('.', '__')
+
+  def _apply_transport_to_grad(
+          self,
+          name,
+          grad,
+          transport_mode='none',
+  ):
+      if transport_mode == 'none':
+          return grad
+
+      key = self._transport_key(name)
+
+      if transport_mode == 'scalar_gate':
+          gate = torch.sigmoid(self.scalar_transport_logits[key]).to(dtype=grad.dtype)
+          return gate * grad
+
+      elif transport_mode == 'low_rank':
+          g_flat = grad.reshape(-1)
+
+          U = self.low_rank_U[key].to(dtype=grad.dtype)
+          V = self.low_rank_V[key].to(dtype=grad.dtype)
+
+          transported_flat = g_flat + U @ (V.t() @ g_flat)
+          transported_grad = transported_flat.view_as(grad)
+          return transported_grad
+
+      else:
+          raise ValueError(f"Unknown transport_mode: {transport_mode}")
+
   def _inner_forward(self, x, params, episode):
     """ Forward pass for the inner loop. """
     feat = self.encoder(x, get_child_dict(params, 'encoder'), episode)
     logits = self.classifier(feat, get_child_dict(params, 'classifier'))
     return logits
 
-  def _inner_iter(self, x, y, params, mom_buffer, episode, inner_args, detach,use_gradient_transport=False):
+  def _inner_iter(
+          self,
+          x,
+          y,
+          params,
+          mom_buffer,
+          episode,
+          inner_args,
+          detach,
+          transport_mode='none',
+          low_rank_rank=4,
+          low_rank_init_scale=1e-3
+  ):
     """ 
     Performs one inner-loop iteration of MAML including the forward and 
     backward passes and the parameter update.
@@ -139,20 +219,32 @@ class MAML(Module):
             lr = inner_args['classifier_lr']
           else:
             raise ValueError('invalid parameter name')
-          if use_gradient_transport:
-              gate_key = name.replace('.', '__')
-              gate = torch.sigmoid(self.gradient_transport_logits[gate_key])
-              transported_grad = gate * grad
-              updated_param = param - lr * transported_grad
-          else:
-              updated_param = param - lr * grad  #AGAG θi′=θi−α∇θiLsupport(θ)
+          transported_grad = self._apply_transport_to_grad(
+              name=name,
+              grad=grad,
+              transport_mode=transport_mode,
+          )
+
+          updated_param = param - lr * transported_grad #AGAG θi′=θi−α∇θiLsupport(θ)
+          #updated_param = param - lr * grad  #AGAG θi′=θi−α∇θiLsupport(θ)
         if detach:
           updated_param = updated_param.detach().requires_grad_(True)
         updated_params[name] = updated_param
 
     return updated_params, mom_buffer
 
-  def _adapt(self, x, y, params, episode, inner_args, meta_train,use_gradient_transport=False):
+  def _adapt(
+          self,
+          x,
+          y,
+          params,
+          episode,
+          inner_args,
+          meta_train,
+          transport_mode='none',
+          low_rank_rank=4,
+          low_rank_init_scale=1e-3
+  ):
     """
     Performs inner-loop adaptation in MAML.
 
@@ -199,7 +291,17 @@ class MAML(Module):
       detach = not torch.is_grad_enabled()  # detach graph in the first pass
       self.is_first_pass(detach)
       params, mom_buffer = self._inner_iter(
-        x, y, params, mom_buffer, int(episode), inner_args, detach, use_gradient_transport=use_gradient_transport)
+          x,
+          y,
+          params,
+          mom_buffer,
+          int(episode),
+          inner_args,
+          detach,
+          transport_mode=transport_mode,
+          low_rank_rank=low_rank_rank,
+          low_rank_init_scale=low_rank_init_scale
+      )
       state = tuple(t if t.requires_grad else t.clone().requires_grad_(True)
         for t in tuple(params.values()) + tuple(mom_buffer.values()))
       return state
@@ -212,8 +314,18 @@ class MAML(Module):
         mom_buffer = OrderedDict(
           zip(mom_buffer_keys, state[-len(mom_buffer_keys):]))
       else:
-        params, mom_buffer = self._inner_iter( #AGAG task için tek bir iterasyon
-          x, y, params, mom_buffer, episode, inner_args, not meta_train,use_gradient_transport=use_gradient_transport)
+          params, mom_buffer = self._inner_iter(
+              x,
+              y,
+              params,
+              mom_buffer,
+              episode,
+              inner_args,
+              not meta_train,
+              transport_mode=transport_mode,
+              low_rank_rank=low_rank_rank,
+              low_rank_init_scale=low_rank_init_scale
+          )
         
     return params
 
@@ -230,7 +342,9 @@ class MAML(Module):
           use_alignment_post_loss=False,  # post-alignment loss aktif mi?
           alignment_pre_weight=0.0,  # pre-alignment loss katsayısı (eta)
           alignment_post_weight=0.0,  # post-alignment loss katsayısı (eta)
-          use_gradient_transport=False
+          transport_mode='none',
+          low_rank_rank=4,
+          low_rank_init_scale=1e-3
   ):
     """
     Args:
@@ -274,7 +388,12 @@ class MAML(Module):
     params = OrderedDict(self.named_parameters())
     for name in list(params.keys()):
       if not params[name].requires_grad or \
-        any(s in name for s in inner_args['frozen'] + ['temp', 'gradient_transport_logits']):
+              any(s in name for s in inner_args['frozen'] + [
+                  'temp',
+                  'scalar_transport_logits',
+                  'low_rank_U',
+                  'low_rank_V'
+              ]):
         params.pop(name)
 
     logits = []
@@ -338,7 +457,9 @@ class MAML(Module):
                   align_pre_loss = alignment_pre_weight * (1.0 - align_pre)
                   align_pre_loss_list.append(align_pre_loss)
       updated_params = self._adapt(  #AGAG Modelin inner loop'u -> θ′=θ−α∇θLsupport
-        x_shot[ep], y_shot[ep], params, ep, inner_args, meta_train, use_gradient_transport=use_gradient_transport)
+        x_shot[ep], y_shot[ep], params, ep, inner_args, meta_train, transport_mode=transport_mode,
+    low_rank_rank=low_rank_rank,
+    low_rank_init_scale=low_rank_init_scale)
       # inner-loop validation
       # Query tarafında gradient gerekip gerekmediğini belirliyoruz.
       # - log alacaksak lazım
