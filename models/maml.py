@@ -145,13 +145,13 @@ class MAML(Module):
           return gate * grad
 
       elif transport_mode == 'low_rank':
-          g_flat = grad.reshape(-1)
+          g_flat = grad.reshape(-1).float()
 
-          U = self.low_rank_U[key].to(dtype=grad.dtype)
-          V = self.low_rank_V[key].to(dtype=grad.dtype)
+          U = self.low_rank_U[key].float()
+          V = self.low_rank_V[key].float()
 
           transported_flat = g_flat + U @ (V.t() @ g_flat)
-          transported_grad = transported_flat.view_as(grad)
+          transported_grad = transported_flat.view_as(grad).to(dtype=grad.dtype)
           return transported_grad
 
       else:
