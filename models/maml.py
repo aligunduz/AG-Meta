@@ -150,7 +150,8 @@ class MAML(Module):
           U = self.low_rank_U[key].float()
           V = self.low_rank_V[key].float()
 
-          transported_flat = g_flat + U @ (V.t() @ g_flat)
+          correction = U @ (V.t() @ g_flat)
+          transported_flat = g_flat + 0.01 * correction
           transported_grad = transported_flat.view_as(grad).to(dtype=grad.dtype)
           return transported_grad
 
