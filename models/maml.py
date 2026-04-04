@@ -345,7 +345,10 @@ class MAML(Module):
           alignment_post_weight=0.0,  # post-alignment loss katsayısı (eta)
           transport_mode='none',
           low_rank_rank=4,
-          low_rank_init_scale=1e-3
+          low_rank_init_scale=1e-3,
+          use_rank1_jacobian_proxy=False,
+          rank1_jacobian_fd_eps=1e-3,
+          rank1_jacobian_normalize=True
   ):
     """
     Args:
@@ -384,6 +387,8 @@ class MAML(Module):
 
     align_pre_list = []
     align_post_list = []
+
+    rank1_proxy_loss_list = []
     # a dictionary of parameters that will be updated in the inner loop
     #AGAG Gereksiz yani gradyanı hesaplanmayacak parametrelerin çıkartılması
     params = OrderedDict(self.named_parameters())
@@ -408,6 +413,7 @@ class MAML(Module):
             m.eval()
 
       g_sup_pre = None
+      g_sup_rank1 = None
       # PRE alignment bloğuna gerçekten ihtiyaç var mı?
       # - log alacaksak lazım
       # - pre-loss kullanacaksak lazım
@@ -457,6 +463,35 @@ class MAML(Module):
               if do_alignment_pre_loss:
                   align_pre_loss = alignment_pre_weight * (1.0 - align_pre)
                   align_pre_loss_list.append(align_pre_loss)
+      if use_rank1_jacobian_proxy and meta_train:
+          with torch.enable_grad():
+              logits_sup_rank1 = self._inner_forward(x_shot[ep], params, ep)
+              loss_sup_rank1 = F.cross_entropy(logits_sup_rank1, y_shot[ep])
+
+              raw_sup_grads = autograd.grad(
+                  loss_sup_rank1,
+                  params.values(),
+                  create_graph=False,
+                  retain_graph=False,
+                  allow_unused=True
+              )
+
+              g_sup_rank1 = []
+              for (name, param), grad in zip(params.items(), raw_sup_grads):
+                  if grad is None:
+                      g_sup_rank1.append(torch.zeros_like(param))
+                  else:
+                      if inner_args['weight_decay'] > 0:
+                          grad = grad + inner_args['weight_decay'] * param
+
+                      # Rank-1 Jacobian tarafında, inner stepte gerçekten kullanılan yönü esas alıyoruz.
+                      grad = self._apply_transport_to_grad(
+                          name=name,
+                          grad=grad,
+                          transport_mode=transport_mode,
+                      )
+
+                      g_sup_rank1.append(grad.detach())
       updated_params = self._adapt(  #AGAG Modelin inner loop'u -> θ′=θ−α∇θLsupport
         x_shot[ep], y_shot[ep], params, ep, inner_args, meta_train, transport_mode=transport_mode,
     low_rank_rank=low_rank_rank,
@@ -474,6 +509,42 @@ class MAML(Module):
       with grad_ctx:
           self.eval()
           logits_ep = self._inner_forward(x_query[ep], updated_params, ep)
+          if use_rank1_jacobian_proxy and meta_train:
+              loss_qry_rank1 = F.cross_entropy(logits_ep, y_query[ep])
+
+              g_qry_rank1 = self._get_grads_from_loss(
+                  loss_qry_rank1,
+                  list(updated_params.values()),
+                  retain_graph=need_post_block,
+                  create_graph=False,
+                  detach_grads=True
+              )
+
+              alpha_rank1 = float(inner_args['encoder_lr'])
+
+              lambda_i = self._estimate_rank1_lambda_fd(
+                  x_shot[ep],
+                  y_shot[ep],
+                  params,
+                  ep,
+                  g_sup_rank1,
+                  fd_eps=rank1_jacobian_fd_eps,
+                  normalize=rank1_jacobian_normalize
+              )
+
+              proxy_flat = self._apply_rank1_jacobian_proxy(
+                  g_qry_rank1,
+                  g_sup_rank1,
+                  lambda_i=lambda_i,
+                  alpha=alpha_rank1,
+                  normalize=rank1_jacobian_normalize
+              )
+
+              proxy_loss_ep = self._proxy_grads_to_surrogate_loss(
+                  proxy_flat,
+                  params
+              )
+              rank1_proxy_loss_list.append(proxy_loss_ep)
 
           # POST alignment bloğuna ihtiyaç var mı?
           if need_post_block:
@@ -506,17 +577,23 @@ class MAML(Module):
 
     self.train(meta_train)
     logits = torch.stack(logits)
+    proxy_loss = None
+    if use_rank1_jacobian_proxy and meta_train:
+        proxy_loss = torch.stack(rank1_proxy_loss_list).mean()
     if return_metrics:
         metrics = {
             'align_pre_mean': sum(align_pre_list) / len(align_pre_list) if len(align_pre_list) > 0 else None,
             'align_post_mean': sum(align_post_list) / len(align_post_list) if len(align_post_list) > 0 else None,
-
-            # Şimdilik bilgi amaçlı döndürüyoruz.
-            # Train.py tarafında ister loglarız ister loss'a ekleriz.
             'align_pre_loss_mean': torch.stack(align_pre_loss_list).mean() if len(align_pre_loss_list) > 0 else None,
             'align_post_loss_mean': torch.stack(align_post_loss_list).mean() if len(align_post_loss_list) > 0 else None,
         }
+        if use_rank1_jacobian_proxy and meta_train:
+            return logits, metrics, proxy_loss
         return logits, metrics
+
+    if use_rank1_jacobian_proxy and meta_train:
+        return logits, proxy_loss
+
     return logits
 
   #AGAG ALIGNMENT LOGLARI İÇİN EKLENEN FONKSİYONLAR
@@ -565,3 +642,106 @@ class MAML(Module):
       v1 = self._flatten_grads(grads1)
       v2 = self._flatten_grads(grads2)
       return F.cosine_similarity(v1, v2, dim=0, eps=eps)
+
+  def _apply_rank1_jacobian_proxy(
+          self,
+          qry_grads,
+          sup_grads,
+          lambda_i,
+          alpha,
+          normalize=True,
+          eps=1e-12
+  ):
+      """
+      Rank-1 Jacobian vekilini uygular.
+
+      v_proxy = v - alpha * lambda_i * (g^T v) * g
+      burada:
+        g = support gradient yönü
+        v = query tarafındaki gradient
+      """
+      g = self._flatten_grads(sup_grads).float()
+      v = self._flatten_grads(qry_grads).float()
+
+      if normalize:
+          g = g / (g.norm() + eps)
+
+      coeff = torch.dot(g, v)
+      v_proxy = v - alpha * lambda_i * coeff * g
+      return v_proxy
+
+  def _estimate_rank1_lambda_fd(
+          self,
+          x,
+          y,
+          params,
+          episode,
+          sup_grads,
+          fd_eps=1e-3,
+          normalize=True,
+          eps=1e-12
+  ):
+      """
+      Support gradient doğrultusundaki eğriliği sonlu farkla yaklaşık hesaplar.
+
+      lambda_i ≈ g^T H g   (normalize=True ise yön normalize edilerek)
+      """
+      g = self._flatten_grads(sup_grads).float()
+
+      if normalize:
+          direction = g / (g.norm() + eps)
+      else:
+          direction = g
+
+      shifted_plus = OrderedDict()
+      shifted_minus = OrderedDict()
+
+      offset = 0
+      for name, p in params.items():
+          n = p.numel()
+          d_part = direction[offset:offset + n].view_as(p).to(dtype=p.dtype, device=p.device)
+
+          shifted_plus[name] = (p + fd_eps * d_part).detach().requires_grad_(True)
+          shifted_minus[name] = (p - fd_eps * d_part).detach().requires_grad_(True)
+          offset += n
+
+      logits_plus = self._inner_forward(x, shifted_plus, episode)
+      loss_plus = F.cross_entropy(logits_plus, y)
+      grads_plus = self._get_grads_from_loss(
+          loss_plus,
+          list(shifted_plus.values()),
+          retain_graph=False,
+          create_graph=False,
+          detach_grads=True
+      )
+
+      logits_minus = self._inner_forward(x, shifted_minus, episode)
+      loss_minus = F.cross_entropy(logits_minus, y)
+      grads_minus = self._get_grads_from_loss(
+          loss_minus,
+          list(shifted_minus.values()),
+          retain_graph=False,
+          create_graph=False,
+          detach_grads=True
+      )
+
+      hv_approx = (self._flatten_grads(grads_plus).float() -
+                   self._flatten_grads(grads_minus).float()) / (2.0 * fd_eps)
+
+      lambda_i = torch.dot(direction, hv_approx)
+      return lambda_i
+
+  def _proxy_grads_to_surrogate_loss(self, proxy_flat, params):
+      """
+      Elle elde edilmiş proxy gradient'i, backward alınabilir skaler loss'a çevirir.
+      """
+      loss = 0.0
+      offset = 0
+
+      for _, p in params.items():
+          n = p.numel()
+          g_part = proxy_flat[offset:offset + n].view_as(p).to(dtype=p.dtype, device=p.device)
+          loss = loss + torch.sum(g_part.detach() * p)
+          offset += n
+
+      return loss

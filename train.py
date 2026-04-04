@@ -71,6 +71,11 @@ def main(config):
   valid_transport_modes = ['none', 'scalar_gate', 'low_rank']
   if transport_mode not in valid_transport_modes:
       raise ValueError(f"Unknown transport_mode: {transport_mode}")
+
+
+  use_rank1_jacobian_proxy = config.get('use_rank1_jacobian_proxy', False)
+  rank1_jacobian_fd_eps = float(config.get('rank1_jacobian_fd_eps', 1e-3))
+  rank1_jacobian_normalize = config.get('rank1_jacobian_normalize', True)
   ##### Dataset #####
 
   # meta-train
@@ -182,36 +187,81 @@ def main(config):
 
       optimizer.zero_grad(set_to_none=True)  # NEW (daha verimli)
       with amp.autocast('cuda'):  # NEW
+          proxy_loss = None
           # Alignment ile ilgili herhangi bir şey açıksa
           # modeli metrics dönecek şekilde çağırıyoruz.
           if need_alignment_outputs:
-              logits, metrics = model(
-                  x_shot,
-                  x_query,
-                  y_shot,
-                  inner_args,
-                  meta_train=True,
-                  y_query=y_query,
-                  return_metrics=True,
-                  use_alignment_pre_loss=use_alignment_pre_loss,
-                  use_alignment_post_loss=use_alignment_post_loss,
-                  alignment_pre_weight=alignment_pre_weight,
-                  alignment_post_weight=alignment_post_weight,
-                  transport_mode=transport_mode,
-                  low_rank_rank=low_rank_rank,
-                  low_rank_init_scale=low_rank_init_scale
-              )
+              if use_rank1_jacobian_proxy:
+                  logits, metrics, proxy_loss = model(
+                      x_shot,
+                      x_query,
+                      y_shot,
+                      inner_args,
+                      meta_train=True,
+                      y_query=y_query,
+                      return_metrics=True,
+                      use_alignment_pre_loss=use_alignment_pre_loss,
+                      use_alignment_post_loss=use_alignment_post_loss,
+                      alignment_pre_weight=alignment_pre_weight,
+                      alignment_post_weight=alignment_post_weight,
+                      transport_mode=transport_mode,
+                      low_rank_rank=low_rank_rank,
+                      low_rank_init_scale=low_rank_init_scale,
+                      use_rank1_jacobian_proxy=use_rank1_jacobian_proxy,
+                      rank1_jacobian_fd_eps=rank1_jacobian_fd_eps,
+                      rank1_jacobian_normalize=rank1_jacobian_normalize
+                  )
+              else:
+                  logits, metrics = model(
+                      x_shot,
+                      x_query,
+                      y_shot,
+                      inner_args,
+                      meta_train=True,
+                      y_query=y_query,
+                      return_metrics=True,
+                      use_alignment_pre_loss=use_alignment_pre_loss,
+                      use_alignment_post_loss=use_alignment_post_loss,
+                      alignment_pre_weight=alignment_pre_weight,
+                      alignment_post_weight=alignment_post_weight,
+                      transport_mode=transport_mode,
+                      low_rank_rank=low_rank_rank,
+                      low_rank_init_scale=low_rank_init_scale,
+                      use_rank1_jacobian_proxy=use_rank1_jacobian_proxy,
+                      rank1_jacobian_fd_eps=rank1_jacobian_fd_eps,
+                      rank1_jacobian_normalize=rank1_jacobian_normalize
+                  )
           else:
-              logits = model(
-                  x_shot,
-                  x_query,
-                  y_shot,
-                  inner_args,
-                  meta_train=True,
-                  transport_mode=transport_mode,
-                  low_rank_rank=low_rank_rank,
-                  low_rank_init_scale=low_rank_init_scale
-              )
+              if use_rank1_jacobian_proxy:
+                  logits, proxy_loss = model(
+                      x_shot,
+                      x_query,
+                      y_shot,
+                      inner_args,
+                      meta_train=True,
+                      y_query=y_query,
+                      transport_mode=transport_mode,
+                      low_rank_rank=low_rank_rank,
+                      low_rank_init_scale=low_rank_init_scale,
+                      use_rank1_jacobian_proxy=use_rank1_jacobian_proxy,
+                      rank1_jacobian_fd_eps=rank1_jacobian_fd_eps,
+                      rank1_jacobian_normalize=rank1_jacobian_normalize
+                  )
+                  metrics = None
+              else:
+                  logits = model(
+                      x_shot,
+                      x_query,
+                      y_shot,
+                      inner_args,
+                      meta_train=True,
+                      transport_mode=transport_mode,
+                      low_rank_rank=low_rank_rank,
+                      low_rank_init_scale=low_rank_init_scale,
+                      use_rank1_jacobian_proxy=use_rank1_jacobian_proxy,
+                      rank1_jacobian_fd_eps=rank1_jacobian_fd_eps,
+                      rank1_jacobian_normalize=rank1_jacobian_normalize
+                  )
               metrics = None
           if log_alignment and metrics is not None:
               if metrics['align_pre_mean'] is not None:
@@ -223,7 +273,7 @@ def main(config):
 
           pred = torch.argmax(logits, dim=-1)
           acc = utils.compute_acc(pred, labels)
-          loss = F.cross_entropy(logits, labels)
+          ce_loss = F.cross_entropy(logits, labels)
           # Toplam alignment cezasını burada ana loss'a ekliyoruz.
           # Başlangıçta sıfır kabul ediyoruz.
           align_loss_total = 0.0
@@ -236,8 +286,12 @@ def main(config):
           if metrics is not None and metrics['align_post_loss_mean'] is not None:
               align_loss_total = align_loss_total + metrics['align_post_loss_mean']
 
+          if use_rank1_jacobian_proxy:
+              loss = proxy_loss + align_loss_total
+          else:
+              loss = ce_loss + align_loss_total
           # Final outer loss = query CE loss + alignment cezası
-          loss = loss + align_loss_total
+          # loss = loss + align_loss_total
 
       # if not did_viz:
       #     from torchviz import make_dot
@@ -278,9 +332,15 @@ def main(config):
             model.reset_classifier()
 
         with torch.no_grad(), amp.autocast('cuda'):  # NEW (val’de de AMP aç)
-            logits = model(x_shot, x_query, y_shot, inner_args, meta_train=False, transport_mode=transport_mode,
-    low_rank_rank=low_rank_rank,
-    low_rank_init_scale=low_rank_init_scale)
+            logits = model(x_shot, x_query, y_shot, inner_args,
+                           meta_train=False,
+                           transport_mode=transport_mode,
+                            low_rank_rank=low_rank_rank,
+                            low_rank_init_scale=low_rank_init_scale,
+                            use_rank1_jacobian_proxy=use_rank1_jacobian_proxy,
+                            rank1_jacobian_fd_eps=rank1_jacobian_fd_eps,
+                            rank1_jacobian_normalize=rank1_jacobian_normalize
+                           )
             logits = logits.flatten(0, 1)
             labels = y_query.flatten()
 
