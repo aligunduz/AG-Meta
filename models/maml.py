@@ -910,9 +910,24 @@ class MAML(Module):
           )
           basis_init = torch.cat([basis_init, random_cols], dim=1)
 
-      Q = self._orthonormalize_columns(basis_init, target_rank=rank)
+      device_type = seed_direction.device.type
+      with torch.autocast(device_type=device_type, enabled=False):
+          Q = self._orthonormalize_columns(basis_init, target_rank=rank)
 
-      for _ in range(max(0, int(power_iters))):
+          for _ in range(max(0, int(power_iters))):
+              HQ = self._estimate_fd_hvp_columns(
+                  x,
+                  y,
+                  params,
+                  episode,
+                  Q,
+                  fd_eps=fd_eps,
+                  track_gradients=track_gradients,
+                  transport_mode=transport_mode,
+                  weight_decay=weight_decay
+              )
+              Q = self._orthonormalize_columns(HQ, target_rank=rank)
+
           HQ = self._estimate_fd_hvp_columns(
               x,
               y,
@@ -924,22 +939,10 @@ class MAML(Module):
               transport_mode=transport_mode,
               weight_decay=weight_decay
           )
-          Q = self._orthonormalize_columns(HQ, target_rank=rank)
+          reduced_hessian = 0.5 * (Q.t() @ HQ + HQ.t() @ Q)
+          reduced_hessian = reduced_hessian.float()
 
-      HQ = self._estimate_fd_hvp_columns(
-          x,
-          y,
-          params,
-          episode,
-          Q,
-          fd_eps=fd_eps,
-          track_gradients=track_gradients,
-          transport_mode=transport_mode,
-          weight_decay=weight_decay
-      )
-      reduced_hessian = 0.5 * (Q.t() @ HQ + HQ.t() @ Q)
-
-      eigvals, eigvecs = torch.linalg.eigh(reduced_hessian)
+          eigvals, eigvecs = torch.linalg.eigh(reduced_hessian)
       order = torch.argsort(eigvals.abs(), descending=True)
       eigvals = eigvals[order[:rank]]
       eigvecs = eigvecs[:, order[:rank]]
