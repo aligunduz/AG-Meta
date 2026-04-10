@@ -76,6 +76,27 @@ def main(config):
   use_rank1_jacobian_proxy = config.get('use_rank1_jacobian_proxy', False)
   rank1_jacobian_fd_eps = float(config.get('rank1_jacobian_fd_eps', 1e-3))
   rank1_jacobian_normalize = config.get('rank1_jacobian_normalize', True)
+
+  use_jacobian_proxy = config.get('use_jacobian_proxy', use_rank1_jacobian_proxy)
+  jacobian_proxy_rank = int(config.get('jacobian_proxy_rank', 1))
+  jacobian_proxy_fd_eps = float(
+      config.get('jacobian_proxy_fd_eps', rank1_jacobian_fd_eps)
+  )
+  jacobian_proxy_normalize = config.get(
+      'jacobian_proxy_normalize', rank1_jacobian_normalize
+  )
+  jacobian_proxy_power_iters = int(config.get('jacobian_proxy_power_iters', 1))
+
+  # Legacy rank-1 configlerini yeni generic Jacobian proxy API'sine map ediyoruz.
+  if use_rank1_jacobian_proxy and 'use_jacobian_proxy' not in config:
+      use_jacobian_proxy = True
+  if use_rank1_jacobian_proxy and 'jacobian_proxy_rank' not in config:
+      jacobian_proxy_rank = 1
+
+  if jacobian_proxy_rank < 1:
+      raise ValueError('jacobian_proxy_rank must be >= 1')
+  if jacobian_proxy_power_iters < 0:
+      raise ValueError('jacobian_proxy_power_iters must be >= 0')
   ##### Dataset #####
 
   # meta-train
@@ -191,7 +212,7 @@ def main(config):
           # Alignment ile ilgili herhangi bir şey açıksa
           # modeli metrics dönecek şekilde çağırıyoruz.
           if need_alignment_outputs:
-              if use_rank1_jacobian_proxy:
+              if use_jacobian_proxy:
                   logits, metrics, proxy_loss = model(
                       x_shot,
                       x_query,
@@ -207,6 +228,11 @@ def main(config):
                       transport_mode=transport_mode,
                       low_rank_rank=low_rank_rank,
                       low_rank_init_scale=low_rank_init_scale,
+                      use_jacobian_proxy=use_jacobian_proxy,
+                      jacobian_proxy_rank=jacobian_proxy_rank,
+                      jacobian_proxy_fd_eps=jacobian_proxy_fd_eps,
+                      jacobian_proxy_normalize=jacobian_proxy_normalize,
+                      jacobian_proxy_power_iters=jacobian_proxy_power_iters,
                       use_rank1_jacobian_proxy=use_rank1_jacobian_proxy,
                       rank1_jacobian_fd_eps=rank1_jacobian_fd_eps,
                       rank1_jacobian_normalize=rank1_jacobian_normalize
@@ -227,12 +253,17 @@ def main(config):
                       transport_mode=transport_mode,
                       low_rank_rank=low_rank_rank,
                       low_rank_init_scale=low_rank_init_scale,
+                      use_jacobian_proxy=use_jacobian_proxy,
+                      jacobian_proxy_rank=jacobian_proxy_rank,
+                      jacobian_proxy_fd_eps=jacobian_proxy_fd_eps,
+                      jacobian_proxy_normalize=jacobian_proxy_normalize,
+                      jacobian_proxy_power_iters=jacobian_proxy_power_iters,
                       use_rank1_jacobian_proxy=use_rank1_jacobian_proxy,
                       rank1_jacobian_fd_eps=rank1_jacobian_fd_eps,
                       rank1_jacobian_normalize=rank1_jacobian_normalize
                   )
           else:
-              if use_rank1_jacobian_proxy:
+              if use_jacobian_proxy:
                   logits, proxy_loss = model(
                       x_shot,
                       x_query,
@@ -243,6 +274,11 @@ def main(config):
                       transport_mode=transport_mode,
                       low_rank_rank=low_rank_rank,
                       low_rank_init_scale=low_rank_init_scale,
+                      use_jacobian_proxy=use_jacobian_proxy,
+                      jacobian_proxy_rank=jacobian_proxy_rank,
+                      jacobian_proxy_fd_eps=jacobian_proxy_fd_eps,
+                      jacobian_proxy_normalize=jacobian_proxy_normalize,
+                      jacobian_proxy_power_iters=jacobian_proxy_power_iters,
                       use_rank1_jacobian_proxy=use_rank1_jacobian_proxy,
                       rank1_jacobian_fd_eps=rank1_jacobian_fd_eps,
                       rank1_jacobian_normalize=rank1_jacobian_normalize
@@ -258,6 +294,11 @@ def main(config):
                       transport_mode=transport_mode,
                       low_rank_rank=low_rank_rank,
                       low_rank_init_scale=low_rank_init_scale,
+                      use_jacobian_proxy=use_jacobian_proxy,
+                      jacobian_proxy_rank=jacobian_proxy_rank,
+                      jacobian_proxy_fd_eps=jacobian_proxy_fd_eps,
+                      jacobian_proxy_normalize=jacobian_proxy_normalize,
+                      jacobian_proxy_power_iters=jacobian_proxy_power_iters,
                       use_rank1_jacobian_proxy=use_rank1_jacobian_proxy,
                       rank1_jacobian_fd_eps=rank1_jacobian_fd_eps,
                       rank1_jacobian_normalize=rank1_jacobian_normalize
@@ -286,7 +327,7 @@ def main(config):
           if metrics is not None and metrics['align_post_loss_mean'] is not None:
               align_loss_total = align_loss_total + metrics['align_post_loss_mean']
 
-          if use_rank1_jacobian_proxy:
+          if use_jacobian_proxy:
               loss = proxy_loss + align_loss_total
           else:
               loss = ce_loss + align_loss_total
@@ -334,9 +375,14 @@ def main(config):
         with torch.no_grad(), amp.autocast('cuda'):  # NEW (val’de de AMP aç)
             logits = model(x_shot, x_query, y_shot, inner_args,
                            meta_train=False,
-                           transport_mode=transport_mode,
+                            transport_mode=transport_mode,
                             low_rank_rank=low_rank_rank,
                             low_rank_init_scale=low_rank_init_scale,
+                            use_jacobian_proxy=use_jacobian_proxy,
+                            jacobian_proxy_rank=jacobian_proxy_rank,
+                            jacobian_proxy_fd_eps=jacobian_proxy_fd_eps,
+                            jacobian_proxy_normalize=jacobian_proxy_normalize,
+                            jacobian_proxy_power_iters=jacobian_proxy_power_iters,
                             use_rank1_jacobian_proxy=use_rank1_jacobian_proxy,
                             rank1_jacobian_fd_eps=rank1_jacobian_fd_eps,
                             rank1_jacobian_normalize=rank1_jacobian_normalize
@@ -416,6 +462,12 @@ def main(config):
       'scalar_transport_logits_state_dict': model_.scalar_transport_logits.state_dict(),
       'low_rank_U_state_dict': model_.low_rank_U.state_dict(),
       'low_rank_V_state_dict': model_.low_rank_V.state_dict(),
+
+      'use_jacobian_proxy': use_jacobian_proxy,
+      'jacobian_proxy_rank': jacobian_proxy_rank,
+      'jacobian_proxy_fd_eps': jacobian_proxy_fd_eps,
+      'jacobian_proxy_normalize': jacobian_proxy_normalize,
+      'jacobian_proxy_power_iters': jacobian_proxy_power_iters,
 
       'training': training,
 

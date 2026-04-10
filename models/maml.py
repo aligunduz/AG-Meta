@@ -38,9 +38,9 @@ def make(enc_name, enc_args, clf_name, clf_args,transport_mode='none',
   return model
 
 
-def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode='none',
-    low_rank_rank=4,
-    low_rank_init_scale=1e-3):
+def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode=None,
+    low_rank_rank=None,
+    low_rank_init_scale=None):
   """
   Initializes a meta model with a pre-trained encoder.
 
@@ -55,6 +55,13 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode='none
   Returns:
     model (MAML): a meta model with a pre-trained encoder.
   """
+  if transport_mode is None:
+    transport_mode = ckpt.get('transport_mode', 'none')
+  if low_rank_rank is None:
+    low_rank_rank = int(ckpt.get('low_rank_rank', 4))
+  if low_rank_init_scale is None:
+    low_rank_init_scale = float(ckpt.get('low_rank_init_scale', 1e-3))
+
   enc = encoders.load(ckpt)
   if load_clf:
     clf = classifiers.load(ckpt)
@@ -343,12 +350,17 @@ class MAML(Module):
           use_alignment_post_loss=False,  # post-alignment loss aktif mi?
           alignment_pre_weight=0.0,  # pre-alignment loss katsayısı (eta)
           alignment_post_weight=0.0,  # post-alignment loss katsayısı (eta)
-          transport_mode='none',
-          low_rank_rank=4,
-          low_rank_init_scale=1e-3,
+          transport_mode=None,
+          low_rank_rank=None,
+          low_rank_init_scale=None,
           use_rank1_jacobian_proxy=False,
           rank1_jacobian_fd_eps=1e-3,
-          rank1_jacobian_normalize=True
+          rank1_jacobian_normalize=True,
+          use_jacobian_proxy=False,
+          jacobian_proxy_rank=1,
+          jacobian_proxy_fd_eps=1e-3,
+          jacobian_proxy_normalize=True,
+          jacobian_proxy_power_iters=1
   ):
     """
     Args:
@@ -366,6 +378,25 @@ class MAML(Module):
     assert self.classifier is not None
     assert x_shot.dim() == 5 and x_query.dim() == 5
     assert x_shot.size(0) == x_query.size(0)
+
+    if transport_mode is None:
+      transport_mode = self.transport_mode
+    if low_rank_rank is None:
+      low_rank_rank = self.low_rank_rank
+    if low_rank_init_scale is None:
+      low_rank_init_scale = self.low_rank_init_scale
+
+    if (not use_jacobian_proxy) and use_rank1_jacobian_proxy:
+      use_jacobian_proxy = True
+      jacobian_proxy_rank = 1
+      jacobian_proxy_fd_eps = rank1_jacobian_fd_eps
+      jacobian_proxy_normalize = rank1_jacobian_normalize
+
+    jacobian_proxy_rank = max(1, int(jacobian_proxy_rank))
+    jacobian_proxy_power_iters = max(0, int(jacobian_proxy_power_iters))
+    enable_transport_proxy_grads = (
+        meta_train and use_jacobian_proxy and (transport_mode != 'none')
+    )
 
     # Alignment metrik/log hesaplaması yapılacak mı?
     # Bunun için hem return_metrics açık olmalı hem de query etiketleri gelmiş olmalı.
@@ -388,7 +419,7 @@ class MAML(Module):
     align_pre_list = []
     align_post_list = []
 
-    rank1_proxy_loss_list = []
+    jacobian_proxy_loss_list = []
     # a dictionary of parameters that will be updated in the inner loop
     #AGAG Gereksiz yani gradyanı hesaplanmayacak parametrelerin çıkartılması
     params = OrderedDict(self.named_parameters())
@@ -413,7 +444,7 @@ class MAML(Module):
             m.eval()
 
       g_sup_pre = None
-      g_sup_rank1 = None
+      jacobian_proxy_state = None
       # PRE alignment bloğuna gerçekten ihtiyaç var mı?
       # - log alacaksak lazım
       # - pre-loss kullanacaksak lazım
@@ -463,35 +494,45 @@ class MAML(Module):
               if do_alignment_pre_loss:
                   align_pre_loss = alignment_pre_weight * (1.0 - align_pre)
                   align_pre_loss_list.append(align_pre_loss)
-      if use_rank1_jacobian_proxy and meta_train:
+      if use_jacobian_proxy and meta_train:
           with torch.enable_grad():
-              logits_sup_rank1 = self._inner_forward(x_shot[ep], params, ep)
-              loss_sup_rank1 = F.cross_entropy(logits_sup_rank1, y_shot[ep])
+              logits_sup_proxy = self._inner_forward(x_shot[ep], params, ep)
+              loss_sup_proxy = F.cross_entropy(logits_sup_proxy, y_shot[ep])
 
               raw_sup_grads = autograd.grad(
-                  loss_sup_rank1,
+                  loss_sup_proxy,
                   params.values(),
                   create_graph=False,
                   retain_graph=False,
                   allow_unused=True
               )
 
-              g_sup_rank1 = []
-              for (name, param), grad in zip(params.items(), raw_sup_grads):
-                  if grad is None:
-                      g_sup_rank1.append(torch.zeros_like(param))
-                  else:
-                      if inner_args['weight_decay'] > 0:
-                          grad = grad + inner_args['weight_decay'] * param
+              g_sup_proxy = self._apply_inner_update_rule_to_grads(
+                  params,
+                  raw_sup_grads,
+                  transport_mode=transport_mode,
+                  weight_decay=inner_args['weight_decay']
+              )
+              if not enable_transport_proxy_grads:
+                  g_sup_proxy = [g.detach() for g in g_sup_proxy]
 
                       # Rank-1 Jacobian tarafında, inner stepte gerçekten kullanılan yönü esas alıyoruz.
-                      grad = self._apply_transport_to_grad(
-                          name=name,
-                          grad=grad,
-                          transport_mode=transport_mode,
-                      )
 
-                      g_sup_rank1.append(grad.detach())
+              jacobian_proxy_state = self._prepare_jacobian_proxy_state(
+                  x_shot[ep],
+                  y_shot[ep],
+                  params,
+                  ep,
+                  g_sup_proxy,
+                  inner_args,
+                  jacobian_proxy_rank=jacobian_proxy_rank,
+                  fd_eps=jacobian_proxy_fd_eps,
+                  normalize=jacobian_proxy_normalize,
+                  power_iters=jacobian_proxy_power_iters,
+                  track_gradients=enable_transport_proxy_grads,
+                  transport_mode=transport_mode,
+                  weight_decay=inner_args['weight_decay']
+              )
       updated_params = self._adapt(  #AGAG Modelin inner loop'u -> θ′=θ−α∇θLsupport
         x_shot[ep], y_shot[ep], params, ep, inner_args, meta_train, transport_mode=transport_mode,
     low_rank_rank=low_rank_rank,
@@ -509,42 +550,27 @@ class MAML(Module):
       with grad_ctx:
           self.eval()
           logits_ep = self._inner_forward(x_query[ep], updated_params, ep)
-          if use_rank1_jacobian_proxy and meta_train:
-              loss_qry_rank1 = F.cross_entropy(logits_ep, y_query[ep])
+          if use_jacobian_proxy and meta_train:
+              loss_qry_proxy = F.cross_entropy(logits_ep, y_query[ep])
 
-              g_qry_rank1 = self._get_grads_from_loss(
-                  loss_qry_rank1,
+              g_qry_proxy = self._get_grads_from_loss(
+                  loss_qry_proxy,
                   list(updated_params.values()),
-                  retain_graph=need_post_block,
-                  create_graph=False,
-                  detach_grads=True
+                  retain_graph=(need_post_block or enable_transport_proxy_grads),
+                  create_graph=enable_transport_proxy_grads,
+                  detach_grads=(not enable_transport_proxy_grads)
               )
 
-              alpha_rank1 = float(inner_args['encoder_lr'])
-
-              lambda_i = self._estimate_rank1_lambda_fd(
-                  x_shot[ep],
-                  y_shot[ep],
-                  params,
-                  ep,
-                  g_sup_rank1,
-                  fd_eps=rank1_jacobian_fd_eps,
-                  normalize=rank1_jacobian_normalize
-              )
-
-              proxy_flat = self._apply_rank1_jacobian_proxy(
-                  g_qry_rank1,
-                  g_sup_rank1,
-                  lambda_i=lambda_i,
-                  alpha=alpha_rank1,
-                  normalize=rank1_jacobian_normalize
+              proxy_flat = self._apply_prepared_jacobian_proxy(
+                  g_qry_proxy,
+                  jacobian_proxy_state
               )
 
               proxy_loss_ep = self._proxy_grads_to_surrogate_loss(
                   proxy_flat,
                   params
               )
-              rank1_proxy_loss_list.append(proxy_loss_ep)
+              jacobian_proxy_loss_list.append(proxy_loss_ep)
 
           # POST alignment bloğuna ihtiyaç var mı?
           if need_post_block:
@@ -578,8 +604,8 @@ class MAML(Module):
     self.train(meta_train)
     logits = torch.stack(logits)
     proxy_loss = None
-    if use_rank1_jacobian_proxy and meta_train:
-        proxy_loss = torch.stack(rank1_proxy_loss_list).mean()
+    if use_jacobian_proxy and meta_train:
+        proxy_loss = torch.stack(jacobian_proxy_loss_list).mean()
     if return_metrics:
         metrics = {
             'align_pre_mean': sum(align_pre_list) / len(align_pre_list) if len(align_pre_list) > 0 else None,
@@ -587,11 +613,11 @@ class MAML(Module):
             'align_pre_loss_mean': torch.stack(align_pre_loss_list).mean() if len(align_pre_loss_list) > 0 else None,
             'align_post_loss_mean': torch.stack(align_post_loss_list).mean() if len(align_post_loss_list) > 0 else None,
         }
-        if use_rank1_jacobian_proxy and meta_train:
+        if use_jacobian_proxy and meta_train:
             return logits, metrics, proxy_loss
         return logits, metrics
 
-    if use_rank1_jacobian_proxy and meta_train:
+    if use_jacobian_proxy and meta_train:
         return logits, proxy_loss
 
     return logits
@@ -643,6 +669,27 @@ class MAML(Module):
       v2 = self._flatten_grads(grads2)
       return F.cosine_similarity(v1, v2, dim=0, eps=eps)
 
+  def _apply_inner_update_rule_to_grads(
+          self,
+          params,
+          grads,
+          transport_mode='none',
+          weight_decay=0.0
+  ):
+      processed_grads = []
+      for (name, param), grad in zip(params.items(), grads):
+          if grad is None:
+              grad = torch.zeros_like(param)
+          if weight_decay > 0:
+              grad = grad + weight_decay * param
+          grad = self._apply_transport_to_grad(
+              name=name,
+              grad=grad,
+              transport_mode=transport_mode,
+          )
+          processed_grads.append(grad)
+      return processed_grads
+
   def _apply_rank1_jacobian_proxy(
           self,
           qry_grads,
@@ -667,7 +714,12 @@ class MAML(Module):
           g = g / (g.norm() + eps)
 
       coeff = torch.dot(g, v)
-      v_proxy = v - alpha * lambda_i * coeff * g
+      if torch.is_tensor(alpha):
+          alpha_vec = alpha.to(device=v.device, dtype=v.dtype)
+      else:
+          alpha_vec = torch.tensor(alpha, device=v.device, dtype=v.dtype)
+
+      v_proxy = v - alpha_vec * lambda_i * coeff * g
       return v_proxy
 
   def _estimate_rank1_lambda_fd(
@@ -679,6 +731,9 @@ class MAML(Module):
           sup_grads,
           fd_eps=1e-3,
           normalize=True,
+          track_gradients=False,
+          transport_mode='none',
+          weight_decay=0.0,
           eps=1e-12
   ):
       """
@@ -693,6 +748,56 @@ class MAML(Module):
       else:
           direction = g
 
+      hv_approx = self._estimate_fd_hvp(
+          x,
+          y,
+          params,
+          episode,
+          direction,
+          fd_eps=fd_eps,
+          track_gradients=track_gradients,
+          transport_mode=transport_mode,
+          weight_decay=weight_decay
+      )
+
+      lambda_i = torch.dot(direction, hv_approx)
+      return lambda_i
+
+  def _build_alpha_flat(self, params, inner_args):
+      alpha_chunks = []
+      for name, param in params.items():
+          if 'encoder' in name:
+              lr = float(inner_args['encoder_lr'])
+          elif 'classifier' in name:
+              lr = float(inner_args['classifier_lr'])
+          else:
+              raise ValueError('invalid parameter name')
+          alpha_chunks.append(
+              torch.full((param.numel(),), lr, device=param.device, dtype=torch.float32)
+          )
+      return torch.cat(alpha_chunks)
+
+  def _orthonormalize_columns(self, matrix, target_rank=None):
+      if matrix.dim() == 1:
+          matrix = matrix.unsqueeze(1)
+      matrix = matrix.float()
+      q, _ = torch.linalg.qr(matrix, mode='reduced')
+      if target_rank is None:
+          return q
+      return q[:, :min(int(target_rank), q.size(1))]
+
+  def _estimate_fd_hvp(
+          self,
+          x,
+          y,
+          params,
+          episode,
+          direction,
+          fd_eps=1e-3,
+          track_gradients=False,
+          transport_mode='none',
+          weight_decay=0.0
+  ):
       shifted_plus = OrderedDict()
       shifted_minus = OrderedDict()
 
@@ -700,9 +805,12 @@ class MAML(Module):
       for name, p in params.items():
           n = p.numel()
           d_part = direction[offset:offset + n].view_as(p).to(dtype=p.dtype, device=p.device)
-
-          shifted_plus[name] = (p + fd_eps * d_part).detach().requires_grad_(True)
-          shifted_minus[name] = (p - fd_eps * d_part).detach().requires_grad_(True)
+          if track_gradients:
+              shifted_plus[name] = p + fd_eps * d_part
+              shifted_minus[name] = p - fd_eps * d_part
+          else:
+              shifted_plus[name] = (p + fd_eps * d_part).detach().requires_grad_(True)
+              shifted_minus[name] = (p - fd_eps * d_part).detach().requires_grad_(True)
           offset += n
 
       logits_plus = self._inner_forward(x, shifted_plus, episode)
@@ -710,9 +818,9 @@ class MAML(Module):
       grads_plus = self._get_grads_from_loss(
           loss_plus,
           list(shifted_plus.values()),
-          retain_graph=False,
-          create_graph=False,
-          detach_grads=True
+          retain_graph=track_gradients,
+          create_graph=track_gradients,
+          detach_grads=(not track_gradients)
       )
 
       logits_minus = self._inner_forward(x, shifted_minus, episode)
@@ -720,16 +828,222 @@ class MAML(Module):
       grads_minus = self._get_grads_from_loss(
           loss_minus,
           list(shifted_minus.values()),
-          retain_graph=False,
-          create_graph=False,
-          detach_grads=True
+          retain_graph=track_gradients,
+          create_graph=track_gradients,
+          detach_grads=(not track_gradients)
       )
 
-      hv_approx = (self._flatten_grads(grads_plus).float() -
-                   self._flatten_grads(grads_minus).float()) / (2.0 * fd_eps)
+      grads_plus = self._apply_inner_update_rule_to_grads(
+          shifted_plus,
+          grads_plus,
+          transport_mode=transport_mode,
+          weight_decay=weight_decay
+      )
+      grads_minus = self._apply_inner_update_rule_to_grads(
+          shifted_minus,
+          grads_minus,
+          transport_mode=transport_mode,
+          weight_decay=weight_decay
+      )
 
-      lambda_i = torch.dot(direction, hv_approx)
-      return lambda_i
+      return (
+          self._flatten_grads(grads_plus).float() -
+          self._flatten_grads(grads_minus).float()
+      ) / (2.0 * fd_eps)
+
+  def _estimate_fd_hvp_columns(
+          self,
+          x,
+          y,
+          params,
+          episode,
+          directions,
+          fd_eps=1e-3,
+          track_gradients=False,
+          transport_mode='none',
+          weight_decay=0.0
+  ):
+      hvp_columns = []
+      for col_idx in range(directions.size(1)):
+          hvp_columns.append(
+              self._estimate_fd_hvp(
+                  x,
+                  y,
+                  params,
+                  episode,
+                  directions[:, col_idx],
+                  fd_eps=fd_eps,
+                  track_gradients=track_gradients,
+                  transport_mode=transport_mode,
+                  weight_decay=weight_decay
+              )
+          )
+      return torch.stack(hvp_columns, dim=1)
+
+  def _estimate_rankr_subspace_fd(
+          self,
+          x,
+          y,
+          params,
+          episode,
+          sup_grads,
+          rank=4,
+          fd_eps=1e-3,
+          normalize=True,
+          power_iters=1,
+          track_gradients=False,
+          transport_mode='none',
+          weight_decay=0.0,
+          eps=1e-12
+  ):
+      seed_direction = self._flatten_grads(sup_grads).float()
+      dim = seed_direction.numel()
+      rank = min(max(1, int(rank)), dim)
+
+      if normalize and seed_direction.norm() > eps:
+          seed_direction = seed_direction / (seed_direction.norm() + eps)
+
+      basis_init = seed_direction.unsqueeze(1)
+      if rank > 1:
+          random_cols = torch.randn(
+              dim, rank - 1, device=seed_direction.device, dtype=seed_direction.dtype
+          )
+          basis_init = torch.cat([basis_init, random_cols], dim=1)
+
+      Q = self._orthonormalize_columns(basis_init, target_rank=rank)
+
+      for _ in range(max(0, int(power_iters))):
+          HQ = self._estimate_fd_hvp_columns(
+              x,
+              y,
+              params,
+              episode,
+              Q,
+              fd_eps=fd_eps,
+              track_gradients=track_gradients,
+              transport_mode=transport_mode,
+              weight_decay=weight_decay
+          )
+          Q = self._orthonormalize_columns(HQ, target_rank=rank)
+
+      HQ = self._estimate_fd_hvp_columns(
+          x,
+          y,
+          params,
+          episode,
+          Q,
+          fd_eps=fd_eps,
+          track_gradients=track_gradients,
+          transport_mode=transport_mode,
+          weight_decay=weight_decay
+      )
+      reduced_hessian = 0.5 * (Q.t() @ HQ + HQ.t() @ Q)
+
+      eigvals, eigvecs = torch.linalg.eigh(reduced_hessian)
+      order = torch.argsort(eigvals.abs(), descending=True)
+      eigvals = eigvals[order[:rank]]
+      eigvecs = eigvecs[:, order[:rank]]
+      basis = Q @ eigvecs
+
+      return {
+          'basis': basis,
+          'curvature': eigvals
+      }
+
+  def _prepare_jacobian_proxy_state(
+          self,
+          x,
+          y,
+          params,
+          episode,
+          sup_grads,
+          inner_args,
+          jacobian_proxy_rank=1,
+          fd_eps=1e-3,
+          normalize=True,
+          power_iters=1,
+          track_gradients=False,
+          transport_mode='none',
+          weight_decay=0.0
+  ):
+      rank = max(1, int(jacobian_proxy_rank))
+      if rank == 1:
+          alpha_rank1 = self._build_alpha_flat(params, inner_args)
+          lambda_i = self._estimate_rank1_lambda_fd(
+              x,
+              y,
+              params,
+              episode,
+              sup_grads,
+              fd_eps=fd_eps,
+              normalize=normalize,
+              track_gradients=track_gradients,
+              transport_mode=transport_mode,
+              weight_decay=weight_decay
+          )
+          return {
+              'kind': 'rank1',
+              'sup_grads': sup_grads,
+              'lambda_i': lambda_i,
+              'alpha': alpha_rank1,
+              'normalize': normalize
+          }
+
+      rankr_state = self._estimate_rankr_subspace_fd(
+          x,
+          y,
+          params,
+          episode,
+          sup_grads,
+          rank=rank,
+          fd_eps=fd_eps,
+          normalize=normalize,
+          power_iters=power_iters,
+          track_gradients=track_gradients,
+          transport_mode=transport_mode,
+          weight_decay=weight_decay
+      )
+      return {
+          'kind': 'rankr',
+          'basis': rankr_state['basis'],
+          'curvature': rankr_state['curvature'],
+          'alpha_flat': self._build_alpha_flat(params, inner_args)
+      }
+
+  def _apply_rankr_jacobian_proxy(
+          self,
+          qry_grads,
+          basis,
+          curvature,
+          alpha_flat
+  ):
+      v = self._flatten_grads(qry_grads).float()
+      coeff = basis.t() @ v
+      transported_basis = alpha_flat.unsqueeze(1) * basis
+      return v - transported_basis @ (curvature * coeff)
+
+  def _apply_prepared_jacobian_proxy(self, qry_grads, proxy_state):
+      if proxy_state is None:
+          raise ValueError('proxy_state must be prepared before applying Jacobian proxy')
+
+      if proxy_state['kind'] == 'rank1':
+          return self._apply_rank1_jacobian_proxy(
+              qry_grads,
+              proxy_state['sup_grads'],
+              lambda_i=proxy_state['lambda_i'],
+              alpha=proxy_state['alpha'],
+              normalize=proxy_state['normalize']
+          )
+
+      if proxy_state['kind'] == 'rankr':
+          return self._apply_rankr_jacobian_proxy(
+              qry_grads,
+              proxy_state['basis'],
+              proxy_state['curvature'],
+              proxy_state['alpha_flat']
+          )
+
+      raise ValueError(f"Unknown proxy_state kind: {proxy_state['kind']}")
 
   def _proxy_grads_to_surrogate_loss(self, proxy_flat, params):
       """
@@ -741,7 +1055,12 @@ class MAML(Module):
       for _, p in params.items():
           n = p.numel()
           g_part = proxy_flat[offset:offset + n].view_as(p).to(dtype=p.dtype, device=p.device)
-          loss = loss + torch.sum(g_part.detach() * p)
+          surrogate = (
+              g_part * p.detach() +
+              g_part.detach() * p -
+              g_part.detach() * p.detach()
+          )
+          loss = loss + torch.sum(surrogate)
           offset += n
 
       return loss

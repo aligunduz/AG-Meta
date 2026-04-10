@@ -34,7 +34,18 @@ def main(config):
 
   ckpt = torch.load(config['load'])
   inner_args = utils.config_inner_args(config.get('inner_args'))
-  model = models.load(ckpt, load_clf=(not inner_args['reset_classifier']))
+  transport_mode = ckpt.get('transport_mode', config.get('transport_mode', 'none'))
+  low_rank_rank = int(ckpt.get('low_rank_rank', config.get('low_rank_rank', 4)))
+  low_rank_init_scale = float(
+    ckpt.get('low_rank_init_scale', config.get('low_rank_init_scale', 1e-3))
+  )
+  model = models.load(
+    ckpt,
+    load_clf=(not inner_args['reset_classifier']),
+    transport_mode=transport_mode,
+    low_rank_rank=low_rank_rank,
+    low_rank_init_scale=low_rank_init_scale
+  )
 
   if args.efficient:
     model.go_efficient()
@@ -66,7 +77,16 @@ def main(config):
           model.reset_classifier()
 
       with amp.autocast('cuda'):  # NEW
-          logits = model(x_shot, x_query, y_shot, inner_args, meta_train=False)
+          logits = model(
+              x_shot,
+              x_query,
+              y_shot,
+              inner_args,
+              meta_train=False,
+              transport_mode=transport_mode,
+              low_rank_rank=low_rank_rank,
+              low_rank_init_scale=low_rank_init_scale
+          )
           logits = logits.view(-1, config['test']['n_way'])
           labels = y_query.view(-1)
 

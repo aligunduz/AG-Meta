@@ -21,4 +21,7 @@ inner_args:
   frozen:
     - bn
 
+transport_mode: "none"      # none | scalar_gate | low_rank
+low_rank_rank: 4
+low_rank_init_scale: 1e-3
 epoch: 10

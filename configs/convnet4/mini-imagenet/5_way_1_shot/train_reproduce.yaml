@@ -48,6 +48,11 @@ alignment_post_weight: 0.1
 transport_mode: "none"      # none | scalar_gate | low_rank
 low_rank_rank: 4
 low_rank_init_scale: 1e-3
+use_jacobian_proxy: true
+jacobian_proxy_rank: 1
+jacobian_proxy_fd_eps: 1e-3
+jacobian_proxy_normalize: true
+jacobian_proxy_power_iters: 1
 use_rank1_jacobian_proxy: true
 rank1_jacobian_fd_eps: 1e-3
 rank1_jacobian_normalize: true
