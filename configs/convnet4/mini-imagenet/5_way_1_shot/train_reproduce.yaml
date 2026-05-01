@@ -48,6 +48,10 @@ alignment_post_weight: 0.1
 transport_mode: "none"      # none | scalar_gate | low_rank
 low_rank_rank: 4
 low_rank_init_scale: 1e-3
+use_shift_aware_residual_gate: false
+residual_gate_eps: 0.05
+residual_gate_hidden_dim: 64
+shift_gate_detach_context: true
 use_jacobian_proxy: true
 jacobian_proxy_rank: 4
 jacobian_proxy_fd_eps: 1e-3

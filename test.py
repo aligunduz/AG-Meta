@@ -39,12 +39,34 @@ def main(config):
   low_rank_init_scale = float(
     ckpt.get('low_rank_init_scale', config.get('low_rank_init_scale', 1e-3))
   )
+  use_shift_aware_residual_gate = ckpt.get(
+    'use_shift_aware_residual_gate',
+    False
+  )
+  residual_gate_eps = float(
+    ckpt.get('residual_gate_eps', config.get('residual_gate_eps', 0.05))
+  )
+  residual_gate_hidden_dim = int(
+    ckpt.get('residual_gate_hidden_dim', config.get('residual_gate_hidden_dim', 64))
+  )
+  shift_gate_detach_context = ckpt.get(
+    'shift_gate_detach_context',
+    config.get('shift_gate_detach_context', True)
+  )
+  if use_shift_aware_residual_gate and transport_mode != 'scalar_gate':
+    raise ValueError(
+      'use_shift_aware_residual_gate requires transport_mode="scalar_gate"'
+    )
   model = models.load(
     ckpt,
     load_clf=(not inner_args['reset_classifier']),
     transport_mode=transport_mode,
     low_rank_rank=low_rank_rank,
-    low_rank_init_scale=low_rank_init_scale
+    low_rank_init_scale=low_rank_init_scale,
+    use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+    residual_gate_eps=residual_gate_eps,
+    residual_gate_hidden_dim=residual_gate_hidden_dim,
+    shift_gate_detach_context=shift_gate_detach_context
   )
 
   if args.efficient:
@@ -85,7 +107,10 @@ def main(config):
               meta_train=False,
               transport_mode=transport_mode,
               low_rank_rank=low_rank_rank,
-              low_rank_init_scale=low_rank_init_scale
+              low_rank_init_scale=low_rank_init_scale,
+              use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+              residual_gate_eps=residual_gate_eps,
+              shift_gate_detach_context=shift_gate_detach_context
           )
           logits = logits.view(-1, config['test']['n_way'])
           labels = y_query.view(-1)

@@ -13,7 +13,11 @@ from .modules import get_child_dict, Module, BatchNorm2d
 
 def make(enc_name, enc_args, clf_name, clf_args,transport_mode='none',
     low_rank_rank=4,
-    low_rank_init_scale=1e-3):
+    low_rank_init_scale=1e-3,
+    use_shift_aware_residual_gate=False,
+    residual_gate_eps=0.05,
+    residual_gate_hidden_dim=64,
+    shift_gate_detach_context=True):
   """
   Initializes a random meta model.
 
@@ -33,14 +37,22 @@ def make(enc_name, enc_args, clf_name, clf_args,transport_mode='none',
       enc, clf,
       transport_mode=transport_mode,
       low_rank_rank=low_rank_rank,
-      low_rank_init_scale=low_rank_init_scale
+      low_rank_init_scale=low_rank_init_scale,
+      use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+      residual_gate_eps=residual_gate_eps,
+      residual_gate_hidden_dim=residual_gate_hidden_dim,
+      shift_gate_detach_context=shift_gate_detach_context
   )
   return model
 
 
 def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode=None,
     low_rank_rank=None,
-    low_rank_init_scale=None):
+    low_rank_init_scale=None,
+    use_shift_aware_residual_gate=None,
+    residual_gate_eps=None,
+    residual_gate_hidden_dim=None,
+    shift_gate_detach_context=None):
   """
   Initializes a meta model with a pre-trained encoder.
 
@@ -61,6 +73,14 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode=None,
     low_rank_rank = int(ckpt.get('low_rank_rank', 4))
   if low_rank_init_scale is None:
     low_rank_init_scale = float(ckpt.get('low_rank_init_scale', 1e-3))
+  if use_shift_aware_residual_gate is None:
+    use_shift_aware_residual_gate = ckpt.get('use_shift_aware_residual_gate', False)
+  if residual_gate_eps is None:
+    residual_gate_eps = float(ckpt.get('residual_gate_eps', 0.05))
+  if residual_gate_hidden_dim is None:
+    residual_gate_hidden_dim = int(ckpt.get('residual_gate_hidden_dim', 64))
+  if shift_gate_detach_context is None:
+    shift_gate_detach_context = ckpt.get('shift_gate_detach_context', True)
 
   enc = encoders.load(ckpt)
   if load_clf:
@@ -75,7 +95,11 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode=None,
       enc, clf,
       transport_mode=transport_mode,
       low_rank_rank=low_rank_rank,
-      low_rank_init_scale=low_rank_init_scale
+      low_rank_init_scale=low_rank_init_scale,
+      use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+      residual_gate_eps=residual_gate_eps,
+      residual_gate_hidden_dim=residual_gate_hidden_dim,
+      shift_gate_detach_context=shift_gate_detach_context
   )
   if 'scalar_transport_logits_state_dict' in ckpt:
       model.scalar_transport_logits.load_state_dict(
@@ -91,13 +115,49 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode=None,
       model.low_rank_V.load_state_dict(
           ckpt['low_rank_V_state_dict']
       )
+
+  if 'shift_gate_delta_state_dict' in ckpt and hasattr(model, 'shift_gate_delta'):
+      model.shift_gate_delta.load_state_dict(
+          ckpt['shift_gate_delta_state_dict']
+      )
+
+  if 'shift_mu_meta' in ckpt and hasattr(model, 'shift_mu_meta'):
+      with torch.no_grad():
+          model.shift_mu_meta.copy_(
+              ckpt['shift_mu_meta'].to(
+                  device=model.shift_mu_meta.device,
+                  dtype=model.shift_mu_meta.dtype
+              )
+          )
+
+  if 'shift_rho_scale' in ckpt and hasattr(model, 'shift_rho_scale'):
+      with torch.no_grad():
+          model.shift_rho_scale.copy_(
+              ckpt['shift_rho_scale'].to(
+                  device=model.shift_rho_scale.device,
+                  dtype=model.shift_rho_scale.dtype
+              )
+          )
+
+  if 'shift_rho_bias' in ckpt and hasattr(model, 'shift_rho_bias'):
+      with torch.no_grad():
+          model.shift_rho_bias.copy_(
+              ckpt['shift_rho_bias'].to(
+                  device=model.shift_rho_bias.device,
+                  dtype=model.shift_rho_bias.dtype
+              )
+          )
   return model
 
 
 class MAML(Module):
   def __init__(self, encoder, classifier,transport_mode='none',
     low_rank_rank=4,
-    low_rank_init_scale=1e-3):
+    low_rank_init_scale=1e-3,
+    use_shift_aware_residual_gate=False,
+    residual_gate_eps=0.05,
+    residual_gate_hidden_dim=64,
+    shift_gate_detach_context=True):
     super(MAML, self).__init__()
     self.encoder = encoder
     self.classifier = classifier
@@ -105,19 +165,29 @@ class MAML(Module):
     self.transport_mode = transport_mode
     self.low_rank_rank = int(low_rank_rank)
     self.low_rank_init_scale = float(low_rank_init_scale)
+    self.use_shift_aware_residual_gate = bool(use_shift_aware_residual_gate)
+    self.residual_gate_eps = float(residual_gate_eps)
+    self.residual_gate_hidden_dim = max(1, int(residual_gate_hidden_dim))
+    self.shift_gate_detach_context = bool(shift_gate_detach_context)
 
     self.scalar_transport_logits = nn.ParameterDict()
     self.low_rank_U = nn.ParameterDict()
     self.low_rank_V = nn.ParameterDict()
     self._build_transport_params()
+    if self.use_shift_aware_residual_gate:
+      self._build_shift_aware_residual_gate()
 
   def reset_classifier(self):
     self.classifier.reset_parameters()
 
   def _build_transport_params(self):
+      self.transport_keys = []
+      self.transport_key_to_index = {}
       for prefix, module in [('encoder', self.encoder), ('classifier', self.classifier)]:
           for name, param in module.named_parameters():
               key = self._transport_key(f'{prefix}.{name}')
+              self.transport_key_to_index[key] = len(self.transport_keys)
+              self.transport_keys.append(key)
 
               self.scalar_transport_logits[key] = nn.Parameter(
                   torch.tensor(4.0, device=param.device, dtype=param.dtype)
@@ -133,14 +203,97 @@ class MAML(Module):
                   torch.randn(n, r, device=param.device, dtype=param.dtype) * self.low_rank_init_scale
               )
 
+  def _build_shift_aware_residual_gate(self):
+      context_dim = int(self.encoder.get_out_dim())
+      hidden_dim = max(1, int(self.residual_gate_hidden_dim))
+      n_gate = len(self.transport_keys)
+
+      self.shift_mu_meta = nn.Parameter(torch.zeros(context_dim))
+      self.shift_rho_scale = nn.Parameter(torch.tensor(0.0))
+      self.shift_rho_bias = nn.Parameter(torch.tensor(-5.0))
+      self.shift_gate_delta = nn.Sequential(
+          nn.Linear(context_dim, hidden_dim),
+          nn.ReLU(inplace=True),
+          nn.Linear(hidden_dim, n_gate)
+      )
+      nn.init.zeros_(self.shift_gate_delta[-1].weight)
+      nn.init.zeros_(self.shift_gate_delta[-1].bias)
+
   def _transport_key(self, name):
       return name.replace('.', '__')
+
+  def _compute_shift_context(self, x, params, episode, detach_context=True):
+      prev_first_pass = self.first_pass
+      self.is_first_pass(False)
+      try:
+          if detach_context:
+              with torch.no_grad():
+                  feat = self.encoder(x, get_child_dict(params, 'encoder'), episode)
+          else:
+              with torch.enable_grad():
+                  feat = self.encoder(x, get_child_dict(params, 'encoder'), episode)
+      finally:
+          self.is_first_pass(prev_first_pass)
+
+      context = feat.mean(dim=0)
+      return context.detach() if detach_context else context
+
+  def _prepare_shift_gate_state(
+          self,
+          x,
+          params,
+          episode,
+          residual_gate_eps=None,
+          shift_gate_detach_context=None
+  ):
+      if residual_gate_eps is None:
+          residual_gate_eps = self.residual_gate_eps
+      if shift_gate_detach_context is None:
+          shift_gate_detach_context = self.shift_gate_detach_context
+
+      context = self._compute_shift_context(
+          x,
+          params,
+          episode,
+          detach_context=shift_gate_detach_context
+      )
+      gate_param = self.shift_mu_meta
+      context = context.to(device=gate_param.device, dtype=gate_param.dtype)
+
+      shift_score = torch.norm(context - self.shift_mu_meta, p=2)
+      rho = torch.sigmoid(self.shift_rho_scale * shift_score + self.shift_rho_bias)
+      delta_gate = torch.tanh(self.shift_gate_delta(context.unsqueeze(0)).squeeze(0))
+
+      base_gate = torch.stack([
+          torch.sigmoid(self.scalar_transport_logits[key].to(dtype=delta_gate.dtype))
+          for key in self.transport_keys
+      ]).to(device=delta_gate.device)
+      effective_gate = base_gate + float(residual_gate_eps) * rho * delta_gate
+
+      return {
+          'eps': float(residual_gate_eps),
+          'rho': rho,
+          'delta_gate': delta_gate,
+          'shift_score': shift_score,
+          'effective_gate': effective_gate
+      }
+
+  def _shift_gate_metrics(self, shift_gate_state):
+      if shift_gate_state is None:
+          return None
+      return {
+          'shift_score': shift_gate_state['shift_score'].detach().item(),
+          'rho_mean': shift_gate_state['rho'].detach().item(),
+          'delta_gate_mean': shift_gate_state['delta_gate'].detach().mean().item(),
+          'effective_gate_mean': shift_gate_state['effective_gate'].detach().mean().item()
+      }
 
   def _apply_transport_to_grad(
           self,
           name,
           grad,
           transport_mode='none',
+          shift_gate_state=None,
   ):
       if transport_mode == 'none':
           return grad
@@ -149,6 +302,11 @@ class MAML(Module):
 
       if transport_mode == 'scalar_gate':
           gate = torch.sigmoid(self.scalar_transport_logits[key]).to(dtype=grad.dtype)
+          if shift_gate_state is not None:
+              idx = self.transport_key_to_index[key]
+              rho = shift_gate_state['rho'].to(device=grad.device, dtype=grad.dtype)
+              delta_gate = shift_gate_state['delta_gate'][idx].to(device=grad.device, dtype=grad.dtype)
+              gate = gate + shift_gate_state['eps'] * rho * delta_gate
           return gate * grad
 
       elif transport_mode == 'low_rank':
@@ -182,7 +340,8 @@ class MAML(Module):
           detach,
           transport_mode='none',
           low_rank_rank=4,
-          low_rank_init_scale=1e-3
+          low_rank_init_scale=1e-3,
+          shift_gate_state=None
   ):
     """ 
     Performs one inner-loop iteration of MAML including the forward and 
@@ -231,6 +390,7 @@ class MAML(Module):
               name=name,
               grad=grad,
               transport_mode=transport_mode,
+              shift_gate_state=shift_gate_state,
           )
 
           updated_param = param - lr * transported_grad #AGAG θi′=θi−α∇θiLsupport(θ)
@@ -251,7 +411,8 @@ class MAML(Module):
           meta_train,
           transport_mode='none',
           low_rank_rank=4,
-          low_rank_init_scale=1e-3
+          low_rank_init_scale=1e-3,
+          shift_gate_state=None
   ):
     """
     Performs inner-loop adaptation in MAML.
@@ -308,7 +469,8 @@ class MAML(Module):
           detach,
           transport_mode=transport_mode,
           low_rank_rank=low_rank_rank,
-          low_rank_init_scale=low_rank_init_scale
+          low_rank_init_scale=low_rank_init_scale,
+          shift_gate_state=shift_gate_state
       )
       state = tuple(t if t.requires_grad else t.clone().requires_grad_(True)
         for t in tuple(params.values()) + tuple(mom_buffer.values()))
@@ -332,7 +494,8 @@ class MAML(Module):
               not meta_train,
               transport_mode=transport_mode,
               low_rank_rank=low_rank_rank,
-              low_rank_init_scale=low_rank_init_scale
+              low_rank_init_scale=low_rank_init_scale,
+              shift_gate_state=shift_gate_state
           )
         
     return params
@@ -360,7 +523,11 @@ class MAML(Module):
           jacobian_proxy_rank=1,
           jacobian_proxy_fd_eps=1e-3,
           jacobian_proxy_normalize=True,
-          jacobian_proxy_power_iters=1
+          jacobian_proxy_power_iters=1,
+          use_shift_aware_residual_gate=None,
+          residual_gate_eps=None,
+          shift_gate_detach_context=None,
+          return_alignment_metrics=True
   ):
     """
     Args:
@@ -385,6 +552,25 @@ class MAML(Module):
       low_rank_rank = self.low_rank_rank
     if low_rank_init_scale is None:
       low_rank_init_scale = self.low_rank_init_scale
+    if use_shift_aware_residual_gate is None:
+      use_shift_aware_residual_gate = self.use_shift_aware_residual_gate
+    if residual_gate_eps is None:
+      residual_gate_eps = self.residual_gate_eps
+    if shift_gate_detach_context is None:
+      shift_gate_detach_context = self.shift_gate_detach_context
+
+    use_shift_aware_residual_gate = bool(use_shift_aware_residual_gate)
+    residual_gate_eps = float(residual_gate_eps)
+    shift_gate_detach_context = bool(shift_gate_detach_context)
+
+    if use_shift_aware_residual_gate and transport_mode != 'scalar_gate':
+      raise ValueError(
+          'use_shift_aware_residual_gate requires transport_mode="scalar_gate"'
+      )
+    if use_shift_aware_residual_gate and not hasattr(self, 'shift_gate_delta'):
+      raise ValueError(
+          'model was constructed without shift-aware residual gate parameters'
+      )
 
     if (not use_jacobian_proxy) and use_rank1_jacobian_proxy:
       use_jacobian_proxy = True
@@ -400,7 +586,7 @@ class MAML(Module):
 
     # Alignment metrik/log hesaplaması yapılacak mı?
     # Bunun için hem return_metrics açık olmalı hem de query etiketleri gelmiş olmalı.
-    do_alignment_log = return_metrics and (y_query is not None)
+    do_alignment_log = return_alignment_metrics and return_metrics and (y_query is not None)
 
     # Pre-alignment loss gerçekten train loss'una eklenecek mi?
     # Sadece meta-train sırasında anlamlı.
@@ -418,6 +604,10 @@ class MAML(Module):
 
     align_pre_list = []
     align_post_list = []
+    shift_score_list = []
+    rho_mean_list = []
+    delta_gate_mean_list = []
+    effective_gate_mean_list = []
 
     jacobian_proxy_loss_list = []
     # a dictionary of parameters that will be updated in the inner loop
@@ -429,7 +619,11 @@ class MAML(Module):
                   'temp',
                   'scalar_transport_logits',
                   'low_rank_U',
-                  'low_rank_V'
+                  'low_rank_V',
+                  'shift_gate_delta',
+                  'shift_mu_meta',
+                  'shift_rho_scale',
+                  'shift_rho_bias'
               ]):
         params.pop(name)
 
@@ -445,6 +639,20 @@ class MAML(Module):
 
       g_sup_pre = None
       jacobian_proxy_state = None
+      shift_gate_state = None
+      if use_shift_aware_residual_gate:
+          shift_gate_state = self._prepare_shift_gate_state(
+              x_shot[ep],
+              params,
+              ep,
+              residual_gate_eps=residual_gate_eps,
+              shift_gate_detach_context=shift_gate_detach_context
+          )
+          shift_metrics = self._shift_gate_metrics(shift_gate_state)
+          shift_score_list.append(shift_metrics['shift_score'])
+          rho_mean_list.append(shift_metrics['rho_mean'])
+          delta_gate_mean_list.append(shift_metrics['delta_gate_mean'])
+          effective_gate_mean_list.append(shift_metrics['effective_gate_mean'])
       # PRE alignment bloğuna gerçekten ihtiyaç var mı?
       # - log alacaksak lazım
       # - pre-loss kullanacaksak lazım
@@ -511,7 +719,8 @@ class MAML(Module):
                   params,
                   raw_sup_grads,
                   transport_mode=transport_mode,
-                  weight_decay=inner_args['weight_decay']
+                  weight_decay=inner_args['weight_decay'],
+                  shift_gate_state=shift_gate_state
               )
               if not enable_transport_proxy_grads:
                   g_sup_proxy = [g.detach() for g in g_sup_proxy]
@@ -531,12 +740,14 @@ class MAML(Module):
                   power_iters=jacobian_proxy_power_iters,
                   track_gradients=enable_transport_proxy_grads,
                   transport_mode=transport_mode,
-                  weight_decay=inner_args['weight_decay']
+                  weight_decay=inner_args['weight_decay'],
+                  shift_gate_state=shift_gate_state
               )
       updated_params = self._adapt(  #AGAG Modelin inner loop'u -> θ′=θ−α∇θLsupport
         x_shot[ep], y_shot[ep], params, ep, inner_args, meta_train, transport_mode=transport_mode,
     low_rank_rank=low_rank_rank,
-    low_rank_init_scale=low_rank_init_scale)
+    low_rank_init_scale=low_rank_init_scale,
+    shift_gate_state=shift_gate_state)
       # inner-loop validation
       # Query tarafında gradient gerekip gerekmediğini belirliyoruz.
       # - log alacaksak lazım
@@ -612,6 +823,10 @@ class MAML(Module):
             'align_post_mean': sum(align_post_list) / len(align_post_list) if len(align_post_list) > 0 else None,
             'align_pre_loss_mean': torch.stack(align_pre_loss_list).mean() if len(align_pre_loss_list) > 0 else None,
             'align_post_loss_mean': torch.stack(align_post_loss_list).mean() if len(align_post_loss_list) > 0 else None,
+            'shift_score': sum(shift_score_list) / len(shift_score_list) if len(shift_score_list) > 0 else None,
+            'rho_mean': sum(rho_mean_list) / len(rho_mean_list) if len(rho_mean_list) > 0 else None,
+            'delta_gate_mean': sum(delta_gate_mean_list) / len(delta_gate_mean_list) if len(delta_gate_mean_list) > 0 else None,
+            'effective_gate_mean': sum(effective_gate_mean_list) / len(effective_gate_mean_list) if len(effective_gate_mean_list) > 0 else None,
         }
         if use_jacobian_proxy and meta_train:
             return logits, metrics, proxy_loss
@@ -674,7 +889,8 @@ class MAML(Module):
           params,
           grads,
           transport_mode='none',
-          weight_decay=0.0
+          weight_decay=0.0,
+          shift_gate_state=None
   ):
       processed_grads = []
       for (name, param), grad in zip(params.items(), grads):
@@ -686,6 +902,7 @@ class MAML(Module):
               name=name,
               grad=grad,
               transport_mode=transport_mode,
+              shift_gate_state=shift_gate_state,
           )
           processed_grads.append(grad)
       return processed_grads
@@ -734,6 +951,7 @@ class MAML(Module):
           track_gradients=False,
           transport_mode='none',
           weight_decay=0.0,
+          shift_gate_state=None,
           eps=1e-12
   ):
       """
@@ -757,7 +975,8 @@ class MAML(Module):
           fd_eps=fd_eps,
           track_gradients=track_gradients,
           transport_mode=transport_mode,
-          weight_decay=weight_decay
+          weight_decay=weight_decay,
+          shift_gate_state=shift_gate_state
       )
 
       lambda_i = torch.dot(direction, hv_approx)
@@ -796,7 +1015,8 @@ class MAML(Module):
           fd_eps=1e-3,
           track_gradients=False,
           transport_mode='none',
-          weight_decay=0.0
+          weight_decay=0.0,
+          shift_gate_state=None
   ):
       shifted_plus = OrderedDict()
       shifted_minus = OrderedDict()
@@ -837,13 +1057,15 @@ class MAML(Module):
           shifted_plus,
           grads_plus,
           transport_mode=transport_mode,
-          weight_decay=weight_decay
+          weight_decay=weight_decay,
+          shift_gate_state=shift_gate_state
       )
       grads_minus = self._apply_inner_update_rule_to_grads(
           shifted_minus,
           grads_minus,
           transport_mode=transport_mode,
-          weight_decay=weight_decay
+          weight_decay=weight_decay,
+          shift_gate_state=shift_gate_state
       )
 
       return (
@@ -861,7 +1083,8 @@ class MAML(Module):
           fd_eps=1e-3,
           track_gradients=False,
           transport_mode='none',
-          weight_decay=0.0
+          weight_decay=0.0,
+          shift_gate_state=None
   ):
       hvp_columns = []
       for col_idx in range(directions.size(1)):
@@ -875,7 +1098,8 @@ class MAML(Module):
                   fd_eps=fd_eps,
                   track_gradients=track_gradients,
                   transport_mode=transport_mode,
-                  weight_decay=weight_decay
+                  weight_decay=weight_decay,
+                  shift_gate_state=shift_gate_state
               )
           )
       return torch.stack(hvp_columns, dim=1)
@@ -894,6 +1118,7 @@ class MAML(Module):
           track_gradients=False,
           transport_mode='none',
           weight_decay=0.0,
+          shift_gate_state=None,
           eps=1e-12
   ):
       seed_direction = self._flatten_grads(sup_grads).float()
@@ -924,7 +1149,8 @@ class MAML(Module):
                   fd_eps=fd_eps,
                   track_gradients=track_gradients,
                   transport_mode=transport_mode,
-                  weight_decay=weight_decay
+                  weight_decay=weight_decay,
+                  shift_gate_state=shift_gate_state
               )
               Q = self._orthonormalize_columns(HQ, target_rank=rank)
 
@@ -937,7 +1163,8 @@ class MAML(Module):
               fd_eps=fd_eps,
               track_gradients=track_gradients,
               transport_mode=transport_mode,
-              weight_decay=weight_decay
+              weight_decay=weight_decay,
+              shift_gate_state=shift_gate_state
           )
           reduced_hessian = 0.5 * (Q.t() @ HQ + HQ.t() @ Q)
           reduced_hessian = reduced_hessian.float()
@@ -967,7 +1194,8 @@ class MAML(Module):
           power_iters=1,
           track_gradients=False,
           transport_mode='none',
-          weight_decay=0.0
+          weight_decay=0.0,
+          shift_gate_state=None
   ):
       rank = max(1, int(jacobian_proxy_rank))
       if rank == 1:
@@ -982,7 +1210,8 @@ class MAML(Module):
               normalize=normalize,
               track_gradients=track_gradients,
               transport_mode=transport_mode,
-              weight_decay=weight_decay
+              weight_decay=weight_decay,
+              shift_gate_state=shift_gate_state
           )
           return {
               'kind': 'rank1',
@@ -1004,7 +1233,8 @@ class MAML(Module):
           power_iters=power_iters,
           track_gradients=track_gradients,
           transport_mode=transport_mode,
-          weight_decay=weight_decay
+          weight_decay=weight_decay,
+          shift_gate_state=shift_gate_state
       )
       return {
           'kind': 'rankr',

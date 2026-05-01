@@ -67,10 +67,19 @@ def main(config):
   transport_mode = config.get('transport_mode', 'none')
   low_rank_rank = int(config.get('low_rank_rank', 4))
   low_rank_init_scale = float(config.get('low_rank_init_scale', 1e-3))
+  use_shift_aware_residual_gate = config.get('use_shift_aware_residual_gate', False)
+  residual_gate_eps = float(config.get('residual_gate_eps', 0.05))
+  residual_gate_hidden_dim = int(config.get('residual_gate_hidden_dim', 64))
+  shift_gate_detach_context = config.get('shift_gate_detach_context', True)
 
   valid_transport_modes = ['none', 'scalar_gate', 'low_rank']
   if transport_mode not in valid_transport_modes:
       raise ValueError(f"Unknown transport_mode: {transport_mode}")
+  if (not config.get('load')) and use_shift_aware_residual_gate and transport_mode != 'scalar_gate':
+      raise ValueError(
+          'use_shift_aware_residual_gate requires transport_mode="scalar_gate"'
+      )
+  need_model_metrics = need_alignment_outputs or use_shift_aware_residual_gate
 
 
   use_rank1_jacobian_proxy = config.get('use_rank1_jacobian_proxy', False)
@@ -130,12 +139,30 @@ def main(config):
     transport_mode = ckpt.get('transport_mode', transport_mode)
     low_rank_rank = int(ckpt.get('low_rank_rank', low_rank_rank))
     low_rank_init_scale = float(ckpt.get('low_rank_init_scale', low_rank_init_scale))
+    use_shift_aware_residual_gate = ckpt.get(
+        'use_shift_aware_residual_gate', False
+    )
+    residual_gate_eps = float(ckpt.get('residual_gate_eps', residual_gate_eps))
+    residual_gate_hidden_dim = int(
+        ckpt.get('residual_gate_hidden_dim', residual_gate_hidden_dim)
+    )
+    shift_gate_detach_context = ckpt.get(
+        'shift_gate_detach_context', shift_gate_detach_context
+    )
+    if use_shift_aware_residual_gate and transport_mode != 'scalar_gate':
+        raise ValueError(
+            'use_shift_aware_residual_gate requires transport_mode="scalar_gate"'
+        )
     model = models.load(
         ckpt,
         load_clf=(not inner_args['reset_classifier']),
         transport_mode=transport_mode,
         low_rank_rank=low_rank_rank,
-        low_rank_init_scale=low_rank_init_scale
+        low_rank_init_scale=low_rank_init_scale,
+        use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+        residual_gate_eps=residual_gate_eps,
+        residual_gate_hidden_dim=residual_gate_hidden_dim,
+        shift_gate_detach_context=shift_gate_detach_context
     )
     optimizer, lr_scheduler = optimizers.load(ckpt, model.parameters())
     start_epoch = ckpt['training']['epoch'] + 1
@@ -152,12 +179,18 @@ def main(config):
         config['classifier_args'],
         transport_mode=transport_mode,
         low_rank_rank=low_rank_rank,
-        low_rank_init_scale=low_rank_init_scale
+        low_rank_init_scale=low_rank_init_scale,
+        use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+        residual_gate_eps=residual_gate_eps,
+        residual_gate_hidden_dim=residual_gate_hidden_dim,
+        shift_gate_detach_context=shift_gate_detach_context
     )
     optimizer, lr_scheduler = optimizers.make(
       config['optimizer'], model.parameters(), **config['optimizer_args'])
     start_epoch = 1
     max_va = 0.
+
+  need_model_metrics = need_alignment_outputs or use_shift_aware_residual_gate
 
   if args.efficient:
     model.go_efficient()
@@ -178,6 +211,8 @@ def main(config):
   aves_keys = ['tl', 'ta', 'vl', 'va']
   if log_alignment:
       aves_keys += ['align_pre', 'align_post']
+  if use_shift_aware_residual_gate:
+      aves_keys += ['shift_score', 'rho_mean', 'delta_gate_mean', 'effective_gate_mean']
   trlog = dict()
   for k in aves_keys:
     trlog[k] = []
@@ -211,7 +246,7 @@ def main(config):
           proxy_loss = None
           # Alignment ile ilgili herhangi bir şey açıksa
           # modeli metrics dönecek şekilde çağırıyoruz.
-          if need_alignment_outputs:
+          if need_model_metrics:
               if use_jacobian_proxy:
                   logits, metrics, proxy_loss = model(
                       x_shot,
@@ -228,6 +263,10 @@ def main(config):
                       transport_mode=transport_mode,
                       low_rank_rank=low_rank_rank,
                       low_rank_init_scale=low_rank_init_scale,
+                      use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+                      residual_gate_eps=residual_gate_eps,
+                      shift_gate_detach_context=shift_gate_detach_context,
+                      return_alignment_metrics=log_alignment,
                       use_jacobian_proxy=use_jacobian_proxy,
                       jacobian_proxy_rank=jacobian_proxy_rank,
                       jacobian_proxy_fd_eps=jacobian_proxy_fd_eps,
@@ -253,6 +292,10 @@ def main(config):
                       transport_mode=transport_mode,
                       low_rank_rank=low_rank_rank,
                       low_rank_init_scale=low_rank_init_scale,
+                      use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+                      residual_gate_eps=residual_gate_eps,
+                      shift_gate_detach_context=shift_gate_detach_context,
+                      return_alignment_metrics=log_alignment,
                       use_jacobian_proxy=use_jacobian_proxy,
                       jacobian_proxy_rank=jacobian_proxy_rank,
                       jacobian_proxy_fd_eps=jacobian_proxy_fd_eps,
@@ -274,6 +317,9 @@ def main(config):
                       transport_mode=transport_mode,
                       low_rank_rank=low_rank_rank,
                       low_rank_init_scale=low_rank_init_scale,
+                      use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+                      residual_gate_eps=residual_gate_eps,
+                      shift_gate_detach_context=shift_gate_detach_context,
                       use_jacobian_proxy=use_jacobian_proxy,
                       jacobian_proxy_rank=jacobian_proxy_rank,
                       jacobian_proxy_fd_eps=jacobian_proxy_fd_eps,
@@ -294,6 +340,9 @@ def main(config):
                       transport_mode=transport_mode,
                       low_rank_rank=low_rank_rank,
                       low_rank_init_scale=low_rank_init_scale,
+                      use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+                      residual_gate_eps=residual_gate_eps,
+                      shift_gate_detach_context=shift_gate_detach_context,
                       use_jacobian_proxy=use_jacobian_proxy,
                       jacobian_proxy_rank=jacobian_proxy_rank,
                       jacobian_proxy_fd_eps=jacobian_proxy_fd_eps,
@@ -309,6 +358,10 @@ def main(config):
                   aves['align_pre'].update(metrics['align_pre_mean'], 1)
               if metrics['align_post_mean'] is not None:
                   aves['align_post'].update(metrics['align_post_mean'], 1)
+          if use_shift_aware_residual_gate and metrics is not None:
+              for key in ['shift_score', 'rho_mean', 'delta_gate_mean', 'effective_gate_mean']:
+                  if metrics[key] is not None:
+                      aves[key].update(metrics[key], 1)
           logits = logits.flatten(0, 1)
           labels = y_query.flatten()
 
@@ -378,6 +431,9 @@ def main(config):
                             transport_mode=transport_mode,
                             low_rank_rank=low_rank_rank,
                             low_rank_init_scale=low_rank_init_scale,
+                            use_shift_aware_residual_gate=use_shift_aware_residual_gate,
+                            residual_gate_eps=residual_gate_eps,
+                            shift_gate_detach_context=shift_gate_detach_context,
                             use_jacobian_proxy=use_jacobian_proxy,
                             jacobian_proxy_rank=jacobian_proxy_rank,
                             jacobian_proxy_fd_eps=jacobian_proxy_fd_eps,
@@ -417,6 +473,17 @@ def main(config):
     if log_alignment:
         writer.add_scalar('alignment/align_pre', aves['align_pre'], epoch)
         writer.add_scalar('alignment/align_post', aves['align_post'], epoch)
+    if use_shift_aware_residual_gate:
+        writer.add_scalar('shift_gate/shift_score', aves['shift_score'], epoch)
+        writer.add_scalar('shift_gate/rho_mean', aves['rho_mean'], epoch)
+        writer.add_scalar('shift_gate/delta_gate_mean', aves['delta_gate_mean'], epoch)
+        writer.add_scalar('shift_gate/effective_gate_mean', aves['effective_gate_mean'], epoch)
+        log_str += ', shift {:.4f}, rho {:.4f}, delta {:.4f}, gate {:.4f}'.format(
+            aves['shift_score'],
+            aves['rho_mean'],
+            aves['delta_gate_mean'],
+            aves['effective_gate_mean']
+        )
     if eval_val:
       if log_alignment:
           log_str += ', meta-val {:.4f}|{:.4f}, align {:.4f}|{:.4f}'.format(aves['vl'], aves['va'], aves['align_pre'], aves['align_post'])
@@ -459,6 +526,10 @@ def main(config):
       'transport_mode': transport_mode,
       'low_rank_rank': low_rank_rank,
       'low_rank_init_scale': low_rank_init_scale,
+      'use_shift_aware_residual_gate': use_shift_aware_residual_gate,
+      'residual_gate_eps': residual_gate_eps,
+      'residual_gate_hidden_dim': residual_gate_hidden_dim,
+      'shift_gate_detach_context': shift_gate_detach_context,
       'scalar_transport_logits_state_dict': model_.scalar_transport_logits.state_dict(),
       'low_rank_U_state_dict': model_.low_rank_U.state_dict(),
       'low_rank_V_state_dict': model_.low_rank_V.state_dict(),
@@ -472,6 +543,13 @@ def main(config):
       'training': training,
 
     }
+    if use_shift_aware_residual_gate:
+      ckpt.update({
+        'shift_gate_delta_state_dict': model_.shift_gate_delta.state_dict(),
+        'shift_mu_meta': model_.shift_mu_meta.detach().cpu(),
+        'shift_rho_scale': model_.shift_rho_scale.detach().cpu(),
+        'shift_rho_bias': model_.shift_rho_bias.detach().cpu(),
+      })
 
     # 'epoch-last.pth': saved at the latest epoch
     # 'max-va.pth': saved when validation accuracy is at its maximum
