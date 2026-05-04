@@ -28,4 +28,9 @@ use_shift_aware_residual_gate: false
 residual_gate_eps: 0.05
 residual_gate_hidden_dim: 64
 shift_gate_detach_context: true
+residual_gate_rho_scale: 2.0
+residual_gate_rho_tau: 1.0
+shift_context_ema_momentum: 0.01
+shift_score_ema_momentum: 0.01
+residual_gate_sparsity_weight: 0.001
 epoch: 10

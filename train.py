@@ -71,6 +71,11 @@ def main(config):
   residual_gate_eps = float(config.get('residual_gate_eps', 0.05))
   residual_gate_hidden_dim = int(config.get('residual_gate_hidden_dim', 64))
   shift_gate_detach_context = config.get('shift_gate_detach_context', True)
+  residual_gate_rho_scale = float(config.get('residual_gate_rho_scale', 2.0))
+  residual_gate_rho_tau = float(config.get('residual_gate_rho_tau', 1.0))
+  shift_context_ema_momentum = float(config.get('shift_context_ema_momentum', 0.01))
+  shift_score_ema_momentum = float(config.get('shift_score_ema_momentum', 0.01))
+  residual_gate_sparsity_weight = float(config.get('residual_gate_sparsity_weight', 1e-3))
 
   valid_transport_modes = ['none', 'scalar_gate', 'low_rank']
   if transport_mode not in valid_transport_modes:
@@ -149,6 +154,21 @@ def main(config):
     shift_gate_detach_context = ckpt.get(
         'shift_gate_detach_context', shift_gate_detach_context
     )
+    residual_gate_rho_scale = float(
+        ckpt.get('residual_gate_rho_scale', residual_gate_rho_scale)
+    )
+    residual_gate_rho_tau = float(
+        ckpt.get('residual_gate_rho_tau', residual_gate_rho_tau)
+    )
+    shift_context_ema_momentum = float(
+        ckpt.get('shift_context_ema_momentum', shift_context_ema_momentum)
+    )
+    shift_score_ema_momentum = float(
+        ckpt.get('shift_score_ema_momentum', shift_score_ema_momentum)
+    )
+    residual_gate_sparsity_weight = float(
+        ckpt.get('residual_gate_sparsity_weight', residual_gate_sparsity_weight)
+    )
     if use_shift_aware_residual_gate and transport_mode != 'scalar_gate':
         raise ValueError(
             'use_shift_aware_residual_gate requires transport_mode="scalar_gate"'
@@ -162,9 +182,24 @@ def main(config):
         use_shift_aware_residual_gate=use_shift_aware_residual_gate,
         residual_gate_eps=residual_gate_eps,
         residual_gate_hidden_dim=residual_gate_hidden_dim,
-        shift_gate_detach_context=shift_gate_detach_context
+        shift_gate_detach_context=shift_gate_detach_context,
+        residual_gate_rho_scale=residual_gate_rho_scale,
+        residual_gate_rho_tau=residual_gate_rho_tau,
+        shift_context_ema_momentum=shift_context_ema_momentum,
+        shift_score_ema_momentum=shift_score_ema_momentum
     )
-    optimizer, lr_scheduler = optimizers.load(ckpt, model.parameters())
+    try:
+        optimizer, lr_scheduler = optimizers.load(ckpt, model.parameters())
+    except ValueError as exc:
+        utils.log(
+            'optimizer state is incompatible with the current model; '
+            'reinitializing optimizer ({})'.format(exc)
+        )
+        optimizer, lr_scheduler = optimizers.make(
+            ckpt['training']['optimizer'],
+            model.parameters(),
+            **ckpt['training']['optimizer_args']
+        )
     start_epoch = ckpt['training']['epoch'] + 1
     max_va = ckpt['training']['max_va']
   else:
@@ -183,7 +218,11 @@ def main(config):
         use_shift_aware_residual_gate=use_shift_aware_residual_gate,
         residual_gate_eps=residual_gate_eps,
         residual_gate_hidden_dim=residual_gate_hidden_dim,
-        shift_gate_detach_context=shift_gate_detach_context
+        shift_gate_detach_context=shift_gate_detach_context,
+        residual_gate_rho_scale=residual_gate_rho_scale,
+        residual_gate_rho_tau=residual_gate_rho_tau,
+        shift_context_ema_momentum=shift_context_ema_momentum,
+        shift_score_ema_momentum=shift_score_ema_momentum
     )
     optimizer, lr_scheduler = optimizers.make(
       config['optimizer'], model.parameters(), **config['optimizer_args'])
@@ -212,7 +251,22 @@ def main(config):
   if log_alignment:
       aves_keys += ['align_pre', 'align_post']
   if use_shift_aware_residual_gate:
-      aves_keys += ['shift_score', 'rho_mean', 'delta_gate_mean', 'effective_gate_mean']
+      aves_keys += [
+          'shift_score',
+          'shift_score_norm',
+          'rho_mean',
+          'rho_min',
+          'rho_max',
+          'rho_std',
+          'delta_gate_mean',
+          'delta_gate_abs_mean',
+          'delta_gate_min',
+          'delta_gate_max',
+          'base_gate_mean',
+          'residual_term_mean',
+          'effective_gate_mean',
+          'shift_rho_loss'
+      ]
   trlog = dict()
   for k in aves_keys:
     trlog[k] = []
@@ -359,9 +413,25 @@ def main(config):
               if metrics['align_post_mean'] is not None:
                   aves['align_post'].update(metrics['align_post_mean'], 1)
           if use_shift_aware_residual_gate and metrics is not None:
-              for key in ['shift_score', 'rho_mean', 'delta_gate_mean', 'effective_gate_mean']:
+              for key in [
+                  'shift_score',
+                  'shift_score_norm',
+                  'rho_mean',
+                  'rho_min',
+                  'rho_max',
+                  'rho_std',
+                  'delta_gate_mean',
+                  'delta_gate_abs_mean',
+                  'delta_gate_min',
+                  'delta_gate_max',
+                  'base_gate_mean',
+                  'residual_term_mean',
+                  'effective_gate_mean'
+              ]:
                   if metrics[key] is not None:
                       aves[key].update(metrics[key], 1)
+              if metrics['shift_rho_loss_mean'] is not None:
+                  aves['shift_rho_loss'].update(metrics['shift_rho_loss_mean'].detach().item(), 1)
           logits = logits.flatten(0, 1)
           labels = y_query.flatten()
 
@@ -380,10 +450,19 @@ def main(config):
           if metrics is not None and metrics['align_post_loss_mean'] is not None:
               align_loss_total = align_loss_total + metrics['align_post_loss_mean']
 
+          shift_loss_total = 0.0
+          if (
+              use_shift_aware_residual_gate and
+              metrics is not None and
+              metrics['shift_rho_loss_mean'] is not None and
+              residual_gate_sparsity_weight > 0
+          ):
+              shift_loss_total = residual_gate_sparsity_weight * metrics['shift_rho_loss_mean']
+
           if use_jacobian_proxy:
-              loss = proxy_loss + align_loss_total
+              loss = proxy_loss + align_loss_total + shift_loss_total
           else:
-              loss = ce_loss + align_loss_total
+              loss = ce_loss + align_loss_total + shift_loss_total
           # Final outer loss = query CE loss + alignment cezası
           # loss = loss + align_loss_total
 
@@ -475,13 +554,26 @@ def main(config):
         writer.add_scalar('alignment/align_post', aves['align_post'], epoch)
     if use_shift_aware_residual_gate:
         writer.add_scalar('shift_gate/shift_score', aves['shift_score'], epoch)
+        writer.add_scalar('shift_gate/shift_score_norm', aves['shift_score_norm'], epoch)
         writer.add_scalar('shift_gate/rho_mean', aves['rho_mean'], epoch)
+        writer.add_scalar('shift_gate/rho_min', aves['rho_min'], epoch)
+        writer.add_scalar('shift_gate/rho_max', aves['rho_max'], epoch)
+        writer.add_scalar('shift_gate/rho_std', aves['rho_std'], epoch)
         writer.add_scalar('shift_gate/delta_gate_mean', aves['delta_gate_mean'], epoch)
+        writer.add_scalar('shift_gate/delta_gate_abs_mean', aves['delta_gate_abs_mean'], epoch)
+        writer.add_scalar('shift_gate/delta_gate_min', aves['delta_gate_min'], epoch)
+        writer.add_scalar('shift_gate/delta_gate_max', aves['delta_gate_max'], epoch)
+        writer.add_scalar('shift_gate/base_gate_mean', aves['base_gate_mean'], epoch)
+        writer.add_scalar('shift_gate/residual_term_mean', aves['residual_term_mean'], epoch)
         writer.add_scalar('shift_gate/effective_gate_mean', aves['effective_gate_mean'], epoch)
-        log_str += ', shift {:.4f}, rho {:.4f}, delta {:.4f}, gate {:.4f}'.format(
+        writer.add_scalar('shift_gate/rho_sparsity_loss', aves['shift_rho_loss'], epoch)
+        log_str += ', shift {:.4f}|z {:.4f}, rho {:.4f}+/-{:.4f}, delta_abs {:.4f}, res {:.4f}, gate {:.4f}'.format(
             aves['shift_score'],
+            aves['shift_score_norm'],
             aves['rho_mean'],
-            aves['delta_gate_mean'],
+            aves['rho_std'],
+            aves['delta_gate_abs_mean'],
+            aves['residual_term_mean'],
             aves['effective_gate_mean']
         )
     if eval_val:
@@ -530,6 +622,11 @@ def main(config):
       'residual_gate_eps': residual_gate_eps,
       'residual_gate_hidden_dim': residual_gate_hidden_dim,
       'shift_gate_detach_context': shift_gate_detach_context,
+      'residual_gate_rho_scale': residual_gate_rho_scale,
+      'residual_gate_rho_tau': residual_gate_rho_tau,
+      'shift_context_ema_momentum': shift_context_ema_momentum,
+      'shift_score_ema_momentum': shift_score_ema_momentum,
+      'residual_gate_sparsity_weight': residual_gate_sparsity_weight,
       'scalar_transport_logits_state_dict': model_.scalar_transport_logits.state_dict(),
       'low_rank_U_state_dict': model_.low_rank_U.state_dict(),
       'low_rank_V_state_dict': model_.low_rank_V.state_dict(),
@@ -547,8 +644,11 @@ def main(config):
       ckpt.update({
         'shift_gate_delta_state_dict': model_.shift_gate_delta.state_dict(),
         'shift_mu_meta': model_.shift_mu_meta.detach().cpu(),
-        'shift_rho_scale': model_.shift_rho_scale.detach().cpu(),
-        'shift_rho_bias': model_.shift_rho_bias.detach().cpu(),
+        'shift_score_ema_mean': model_.shift_score_ema_mean.detach().cpu(),
+        'shift_score_ema_var': model_.shift_score_ema_var.detach().cpu(),
+        'shift_stats_initialized': model_.shift_stats_initialized.detach().cpu(),
+        'shift_rho_log_scale': model_.shift_rho_log_scale.detach().cpu(),
+        'shift_rho_tau': model_.shift_rho_tau.detach().cpu(),
       })
 
     # 'epoch-last.pth': saved at the latest epoch

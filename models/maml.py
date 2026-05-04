@@ -17,7 +17,11 @@ def make(enc_name, enc_args, clf_name, clf_args,transport_mode='none',
     use_shift_aware_residual_gate=False,
     residual_gate_eps=0.05,
     residual_gate_hidden_dim=64,
-    shift_gate_detach_context=True):
+    shift_gate_detach_context=True,
+    residual_gate_rho_scale=2.0,
+    residual_gate_rho_tau=1.0,
+    shift_context_ema_momentum=0.01,
+    shift_score_ema_momentum=0.01):
   """
   Initializes a random meta model.
 
@@ -41,7 +45,11 @@ def make(enc_name, enc_args, clf_name, clf_args,transport_mode='none',
       use_shift_aware_residual_gate=use_shift_aware_residual_gate,
       residual_gate_eps=residual_gate_eps,
       residual_gate_hidden_dim=residual_gate_hidden_dim,
-      shift_gate_detach_context=shift_gate_detach_context
+      shift_gate_detach_context=shift_gate_detach_context,
+      residual_gate_rho_scale=residual_gate_rho_scale,
+      residual_gate_rho_tau=residual_gate_rho_tau,
+      shift_context_ema_momentum=shift_context_ema_momentum,
+      shift_score_ema_momentum=shift_score_ema_momentum
   )
   return model
 
@@ -52,7 +60,11 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode=None,
     use_shift_aware_residual_gate=None,
     residual_gate_eps=None,
     residual_gate_hidden_dim=None,
-    shift_gate_detach_context=None):
+    shift_gate_detach_context=None,
+    residual_gate_rho_scale=None,
+    residual_gate_rho_tau=None,
+    shift_context_ema_momentum=None,
+    shift_score_ema_momentum=None):
   """
   Initializes a meta model with a pre-trained encoder.
 
@@ -81,6 +93,14 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode=None,
     residual_gate_hidden_dim = int(ckpt.get('residual_gate_hidden_dim', 64))
   if shift_gate_detach_context is None:
     shift_gate_detach_context = ckpt.get('shift_gate_detach_context', True)
+  if residual_gate_rho_scale is None:
+    residual_gate_rho_scale = float(ckpt.get('residual_gate_rho_scale', 2.0))
+  if residual_gate_rho_tau is None:
+    residual_gate_rho_tau = float(ckpt.get('residual_gate_rho_tau', 1.0))
+  if shift_context_ema_momentum is None:
+    shift_context_ema_momentum = float(ckpt.get('shift_context_ema_momentum', 0.01))
+  if shift_score_ema_momentum is None:
+    shift_score_ema_momentum = float(ckpt.get('shift_score_ema_momentum', 0.01))
 
   enc = encoders.load(ckpt)
   if load_clf:
@@ -99,7 +119,11 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode=None,
       use_shift_aware_residual_gate=use_shift_aware_residual_gate,
       residual_gate_eps=residual_gate_eps,
       residual_gate_hidden_dim=residual_gate_hidden_dim,
-      shift_gate_detach_context=shift_gate_detach_context
+      shift_gate_detach_context=shift_gate_detach_context,
+      residual_gate_rho_scale=residual_gate_rho_scale,
+      residual_gate_rho_tau=residual_gate_rho_tau,
+      shift_context_ema_momentum=shift_context_ema_momentum,
+      shift_score_ema_momentum=shift_score_ema_momentum
   )
   if 'scalar_transport_logits_state_dict' in ckpt:
       model.scalar_transport_logits.load_state_dict(
@@ -130,21 +154,45 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode=None,
               )
           )
 
-  if 'shift_rho_scale' in ckpt and hasattr(model, 'shift_rho_scale'):
+  if 'shift_score_ema_mean' in ckpt and hasattr(model, 'shift_score_ema_mean'):
       with torch.no_grad():
-          model.shift_rho_scale.copy_(
-              ckpt['shift_rho_scale'].to(
-                  device=model.shift_rho_scale.device,
-                  dtype=model.shift_rho_scale.dtype
+          model.shift_score_ema_mean.copy_(
+              ckpt['shift_score_ema_mean'].to(
+                  device=model.shift_score_ema_mean.device,
+                  dtype=model.shift_score_ema_mean.dtype
               )
           )
 
-  if 'shift_rho_bias' in ckpt and hasattr(model, 'shift_rho_bias'):
+  if 'shift_score_ema_var' in ckpt and hasattr(model, 'shift_score_ema_var'):
       with torch.no_grad():
-          model.shift_rho_bias.copy_(
-              ckpt['shift_rho_bias'].to(
-                  device=model.shift_rho_bias.device,
-                  dtype=model.shift_rho_bias.dtype
+          model.shift_score_ema_var.copy_(
+              ckpt['shift_score_ema_var'].to(
+                  device=model.shift_score_ema_var.device,
+                  dtype=model.shift_score_ema_var.dtype
+              )
+          )
+
+  if 'shift_stats_initialized' in ckpt and hasattr(model, 'shift_stats_initialized'):
+      with torch.no_grad():
+          model.shift_stats_initialized.copy_(
+              ckpt['shift_stats_initialized'].to(model.shift_stats_initialized.device)
+          )
+
+  if 'shift_rho_log_scale' in ckpt and hasattr(model, 'shift_rho_log_scale'):
+      with torch.no_grad():
+          model.shift_rho_log_scale.copy_(
+              ckpt['shift_rho_log_scale'].to(
+                  device=model.shift_rho_log_scale.device,
+                  dtype=model.shift_rho_log_scale.dtype
+              )
+          )
+
+  if 'shift_rho_tau' in ckpt and hasattr(model, 'shift_rho_tau'):
+      with torch.no_grad():
+          model.shift_rho_tau.copy_(
+              ckpt['shift_rho_tau'].to(
+                  device=model.shift_rho_tau.device,
+                  dtype=model.shift_rho_tau.dtype
               )
           )
   return model
@@ -157,7 +205,11 @@ class MAML(Module):
     use_shift_aware_residual_gate=False,
     residual_gate_eps=0.05,
     residual_gate_hidden_dim=64,
-    shift_gate_detach_context=True):
+    shift_gate_detach_context=True,
+    residual_gate_rho_scale=2.0,
+    residual_gate_rho_tau=1.0,
+    shift_context_ema_momentum=0.01,
+    shift_score_ema_momentum=0.01):
     super(MAML, self).__init__()
     self.encoder = encoder
     self.classifier = classifier
@@ -169,6 +221,10 @@ class MAML(Module):
     self.residual_gate_eps = float(residual_gate_eps)
     self.residual_gate_hidden_dim = max(1, int(residual_gate_hidden_dim))
     self.shift_gate_detach_context = bool(shift_gate_detach_context)
+    self.residual_gate_rho_scale = float(residual_gate_rho_scale)
+    self.residual_gate_rho_tau = float(residual_gate_rho_tau)
+    self.shift_context_ema_momentum = float(shift_context_ema_momentum)
+    self.shift_score_ema_momentum = float(shift_score_ema_momentum)
 
     self.scalar_transport_logits = nn.ParameterDict()
     self.low_rank_U = nn.ParameterDict()
@@ -208,9 +264,14 @@ class MAML(Module):
       hidden_dim = max(1, int(self.residual_gate_hidden_dim))
       n_gate = len(self.transport_keys)
 
-      self.shift_mu_meta = nn.Parameter(torch.zeros(context_dim))
-      self.shift_rho_scale = nn.Parameter(torch.tensor(0.0))
-      self.shift_rho_bias = nn.Parameter(torch.tensor(-5.0))
+      self.register_buffer('shift_mu_meta', torch.zeros(context_dim))
+      self.register_buffer('shift_score_ema_mean', torch.tensor(0.0))
+      self.register_buffer('shift_score_ema_var', torch.tensor(1.0))
+      self.register_buffer('shift_stats_initialized', torch.tensor(False, dtype=torch.bool))
+      rho_scale_init = max(float(self.residual_gate_rho_scale), 1e-4)
+      rho_log_scale_init = torch.log(torch.expm1(torch.tensor(rho_scale_init)))
+      self.shift_rho_log_scale = nn.Parameter(rho_log_scale_init)
+      self.shift_rho_tau = nn.Parameter(torch.tensor(float(self.residual_gate_rho_tau)))
       self.shift_gate_delta = nn.Sequential(
           nn.Linear(context_dim, hidden_dim),
           nn.ReLU(inplace=True),
@@ -238,13 +299,48 @@ class MAML(Module):
       context = feat.mean(dim=0)
       return context.detach() if detach_context else context
 
+  def _update_shift_stats(self, context, shift_score):
+      with torch.no_grad():
+          context_detached = context.detach().to(
+              device=self.shift_mu_meta.device,
+              dtype=self.shift_mu_meta.dtype
+          )
+          score_detached = shift_score.detach().to(
+              device=self.shift_score_ema_mean.device,
+              dtype=self.shift_score_ema_mean.dtype
+          )
+
+          if not bool(self.shift_stats_initialized.item()):
+              self.shift_mu_meta.copy_(context_detached)
+              self.shift_score_ema_mean.copy_(score_detached)
+              self.shift_score_ema_var.fill_(1.0)
+              self.shift_stats_initialized.fill_(True)
+              return
+
+          context_momentum = min(max(float(self.shift_context_ema_momentum), 0.0), 1.0)
+          score_momentum = min(max(float(self.shift_score_ema_momentum), 0.0), 1.0)
+
+          self.shift_mu_meta.mul_(1.0 - context_momentum).add_(
+              context_detached,
+              alpha=context_momentum
+          )
+
+          delta = score_detached - self.shift_score_ema_mean
+          self.shift_score_ema_mean.add_(delta, alpha=score_momentum)
+          self.shift_score_ema_var.mul_(1.0 - score_momentum).add_(
+              delta * delta,
+              alpha=score_momentum * (1.0 - score_momentum)
+          )
+          self.shift_score_ema_var.clamp_(min=1e-6)
+
   def _prepare_shift_gate_state(
           self,
           x,
           params,
           episode,
           residual_gate_eps=None,
-          shift_gate_detach_context=None
+          shift_gate_detach_context=None,
+          update_shift_stats=False
   ):
       if residual_gate_eps is None:
           residual_gate_eps = self.residual_gate_eps
@@ -260,21 +356,56 @@ class MAML(Module):
       gate_param = self.shift_mu_meta
       context = context.to(device=gate_param.device, dtype=gate_param.dtype)
 
-      shift_score = torch.norm(context - self.shift_mu_meta, p=2)
-      rho = torch.sigmoid(self.shift_rho_scale * shift_score + self.shift_rho_bias)
+      stats_initialized = bool(self.shift_stats_initialized.item())
+      if stats_initialized:
+          shift_score_raw = torch.norm(context - self.shift_mu_meta, p=2)
+      else:
+          shift_score_raw = context.new_zeros(())
+
+      if not stats_initialized:
+          shift_score_norm = shift_score_raw.new_zeros(())
+      else:
+          score_mean = self.shift_score_ema_mean.to(
+              device=shift_score_raw.device,
+              dtype=shift_score_raw.dtype
+          )
+          score_std = torch.sqrt(
+              self.shift_score_ema_var.to(
+                  device=shift_score_raw.device,
+                  dtype=shift_score_raw.dtype
+              ) + 1e-6
+          )
+          shift_score_norm = (shift_score_raw - score_mean) / score_std
+
+      rho_scale = F.softplus(self.shift_rho_log_scale).to(
+          device=shift_score_norm.device,
+          dtype=shift_score_norm.dtype
+      )
+      rho_tau = self.shift_rho_tau.to(
+          device=shift_score_norm.device,
+          dtype=shift_score_norm.dtype
+      )
+      rho = torch.sigmoid(rho_scale * (shift_score_norm - rho_tau))
       delta_gate = torch.tanh(self.shift_gate_delta(context.unsqueeze(0)).squeeze(0))
 
       base_gate = torch.stack([
           torch.sigmoid(self.scalar_transport_logits[key].to(dtype=delta_gate.dtype))
           for key in self.transport_keys
       ]).to(device=delta_gate.device)
-      effective_gate = base_gate + float(residual_gate_eps) * rho * delta_gate
+      residual_term = float(residual_gate_eps) * rho * delta_gate
+      effective_gate = base_gate + residual_term
+
+      if update_shift_stats:
+          self._update_shift_stats(context, shift_score_raw)
 
       return {
           'eps': float(residual_gate_eps),
           'rho': rho,
           'delta_gate': delta_gate,
-          'shift_score': shift_score,
+          'shift_score': shift_score_raw,
+          'shift_score_norm': shift_score_norm,
+          'base_gate': base_gate,
+          'residual_term': residual_term,
           'effective_gate': effective_gate
       }
 
@@ -283,8 +414,14 @@ class MAML(Module):
           return None
       return {
           'shift_score': shift_gate_state['shift_score'].detach().item(),
+          'shift_score_norm': shift_gate_state['shift_score_norm'].detach().item(),
           'rho_mean': shift_gate_state['rho'].detach().item(),
           'delta_gate_mean': shift_gate_state['delta_gate'].detach().mean().item(),
+          'delta_gate_abs_mean': shift_gate_state['delta_gate'].detach().abs().mean().item(),
+          'delta_gate_min': shift_gate_state['delta_gate'].detach().min().item(),
+          'delta_gate_max': shift_gate_state['delta_gate'].detach().max().item(),
+          'base_gate_mean': shift_gate_state['base_gate'].detach().mean().item(),
+          'residual_term_mean': shift_gate_state['residual_term'].detach().mean().item(),
           'effective_gate_mean': shift_gate_state['effective_gate'].detach().mean().item()
       }
 
@@ -605,7 +742,14 @@ class MAML(Module):
     align_pre_list = []
     align_post_list = []
     shift_score_list = []
+    shift_score_norm_list = []
+    rho_tensor_list = []
     rho_mean_list = []
+    delta_gate_abs_mean_list = []
+    delta_gate_min_list = []
+    delta_gate_max_list = []
+    base_gate_mean_list = []
+    residual_term_mean_list = []
     delta_gate_mean_list = []
     effective_gate_mean_list = []
 
@@ -622,8 +766,11 @@ class MAML(Module):
                   'low_rank_V',
                   'shift_gate_delta',
                   'shift_mu_meta',
-                  'shift_rho_scale',
-                  'shift_rho_bias'
+                  'shift_score_ema_mean',
+                  'shift_score_ema_var',
+                  'shift_stats_initialized',
+                  'shift_rho_log_scale',
+                  'shift_rho_tau'
               ]):
         params.pop(name)
 
@@ -646,12 +793,20 @@ class MAML(Module):
               params,
               ep,
               residual_gate_eps=residual_gate_eps,
-              shift_gate_detach_context=shift_gate_detach_context
+              shift_gate_detach_context=shift_gate_detach_context,
+              update_shift_stats=meta_train
           )
           shift_metrics = self._shift_gate_metrics(shift_gate_state)
           shift_score_list.append(shift_metrics['shift_score'])
+          shift_score_norm_list.append(shift_metrics['shift_score_norm'])
+          rho_tensor_list.append(shift_gate_state['rho'])
           rho_mean_list.append(shift_metrics['rho_mean'])
           delta_gate_mean_list.append(shift_metrics['delta_gate_mean'])
+          delta_gate_abs_mean_list.append(shift_metrics['delta_gate_abs_mean'])
+          delta_gate_min_list.append(shift_metrics['delta_gate_min'])
+          delta_gate_max_list.append(shift_metrics['delta_gate_max'])
+          base_gate_mean_list.append(shift_metrics['base_gate_mean'])
+          residual_term_mean_list.append(shift_metrics['residual_term_mean'])
           effective_gate_mean_list.append(shift_metrics['effective_gate_mean'])
       # PRE alignment bloğuna gerçekten ihtiyaç var mı?
       # - log alacaksak lazım
@@ -824,9 +979,19 @@ class MAML(Module):
             'align_pre_loss_mean': torch.stack(align_pre_loss_list).mean() if len(align_pre_loss_list) > 0 else None,
             'align_post_loss_mean': torch.stack(align_post_loss_list).mean() if len(align_post_loss_list) > 0 else None,
             'shift_score': sum(shift_score_list) / len(shift_score_list) if len(shift_score_list) > 0 else None,
+            'shift_score_norm': sum(shift_score_norm_list) / len(shift_score_norm_list) if len(shift_score_norm_list) > 0 else None,
             'rho_mean': sum(rho_mean_list) / len(rho_mean_list) if len(rho_mean_list) > 0 else None,
+            'rho_min': min(rho_mean_list) if len(rho_mean_list) > 0 else None,
+            'rho_max': max(rho_mean_list) if len(rho_mean_list) > 0 else None,
+            'rho_std': float(torch.tensor(rho_mean_list).std(unbiased=False).item()) if len(rho_mean_list) > 0 else None,
             'delta_gate_mean': sum(delta_gate_mean_list) / len(delta_gate_mean_list) if len(delta_gate_mean_list) > 0 else None,
+            'delta_gate_abs_mean': sum(delta_gate_abs_mean_list) / len(delta_gate_abs_mean_list) if len(delta_gate_abs_mean_list) > 0 else None,
+            'delta_gate_min': min(delta_gate_min_list) if len(delta_gate_min_list) > 0 else None,
+            'delta_gate_max': max(delta_gate_max_list) if len(delta_gate_max_list) > 0 else None,
+            'base_gate_mean': sum(base_gate_mean_list) / len(base_gate_mean_list) if len(base_gate_mean_list) > 0 else None,
+            'residual_term_mean': sum(residual_term_mean_list) / len(residual_term_mean_list) if len(residual_term_mean_list) > 0 else None,
             'effective_gate_mean': sum(effective_gate_mean_list) / len(effective_gate_mean_list) if len(effective_gate_mean_list) > 0 else None,
+            'shift_rho_loss_mean': torch.stack(rho_tensor_list).mean() if len(rho_tensor_list) > 0 else None,
         }
         if use_jacobian_proxy and meta_train:
             return logits, metrics, proxy_loss

@@ -53,6 +53,18 @@ def main(config):
     'shift_gate_detach_context',
     config.get('shift_gate_detach_context', True)
   )
+  residual_gate_rho_scale = float(
+    ckpt.get('residual_gate_rho_scale', config.get('residual_gate_rho_scale', 2.0))
+  )
+  residual_gate_rho_tau = float(
+    ckpt.get('residual_gate_rho_tau', config.get('residual_gate_rho_tau', 1.0))
+  )
+  shift_context_ema_momentum = float(
+    ckpt.get('shift_context_ema_momentum', config.get('shift_context_ema_momentum', 0.01))
+  )
+  shift_score_ema_momentum = float(
+    ckpt.get('shift_score_ema_momentum', config.get('shift_score_ema_momentum', 0.01))
+  )
   if use_shift_aware_residual_gate and transport_mode != 'scalar_gate':
     raise ValueError(
       'use_shift_aware_residual_gate requires transport_mode="scalar_gate"'
@@ -66,7 +78,11 @@ def main(config):
     use_shift_aware_residual_gate=use_shift_aware_residual_gate,
     residual_gate_eps=residual_gate_eps,
     residual_gate_hidden_dim=residual_gate_hidden_dim,
-    shift_gate_detach_context=shift_gate_detach_context
+    shift_gate_detach_context=shift_gate_detach_context,
+    residual_gate_rho_scale=residual_gate_rho_scale,
+    residual_gate_rho_tau=residual_gate_rho_tau,
+    shift_context_ema_momentum=shift_context_ema_momentum,
+    shift_score_ema_momentum=shift_score_ema_momentum
   )
 
   if args.efficient:
