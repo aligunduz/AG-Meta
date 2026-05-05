@@ -45,7 +45,7 @@ use_alignment_post_loss: false
 alignment_pre_weight: 0.1
 alignment_post_weight: 0.1
 #use_gradient_transport: false
-transport_mode: "none"      # none | scalar_gate | low_rank
+transport_mode: "scalar_gate"      # none | scalar_gate | low_rank
 low_rank_rank: 4
 low_rank_init_scale: 1e-3
 use_shift_aware_residual_gate: false
@@ -57,7 +57,7 @@ residual_gate_rho_tau: 1.0
 shift_context_ema_momentum: 0.01
 shift_score_ema_momentum: 0.01
 residual_gate_sparsity_weight: 0.001
-use_jacobian_proxy: true
+use_jacobian_proxy: false
 jacobian_proxy_rank: 4
 jacobian_proxy_fd_eps: 1e-3
 jacobian_proxy_normalize: true

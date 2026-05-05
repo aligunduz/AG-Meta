@@ -125,17 +125,17 @@ def load(ckpt, load_clf=False, clf_name=None, clf_args=None,transport_mode=None,
       shift_context_ema_momentum=shift_context_ema_momentum,
       shift_score_ema_momentum=shift_score_ema_momentum
   )
-  if 'scalar_transport_logits_state_dict' in ckpt:
+  if 'scalar_transport_logits_state_dict' in ckpt and len(model.scalar_transport_logits) > 0:
       model.scalar_transport_logits.load_state_dict(
           ckpt['scalar_transport_logits_state_dict']
       )
 
-  if 'low_rank_U_state_dict' in ckpt:
+  if 'low_rank_U_state_dict' in ckpt and len(model.low_rank_U) > 0:
       model.low_rank_U.load_state_dict(
           ckpt['low_rank_U_state_dict']
       )
 
-  if 'low_rank_V_state_dict' in ckpt:
+  if 'low_rank_V_state_dict' in ckpt and len(model.low_rank_V) > 0:
       model.low_rank_V.load_state_dict(
           ckpt['low_rank_V_state_dict']
       )
@@ -245,19 +245,21 @@ class MAML(Module):
               self.transport_key_to_index[key] = len(self.transport_keys)
               self.transport_keys.append(key)
 
-              self.scalar_transport_logits[key] = nn.Parameter(
-                  torch.tensor(4.0, device=param.device, dtype=param.dtype)
-              )
+              if self.transport_mode == 'scalar_gate':
+                  self.scalar_transport_logits[key] = nn.Parameter(
+                      torch.tensor(4.0, device=param.device, dtype=param.dtype)
+                  )
 
-              n = param.numel()
-              r = min(self.low_rank_rank, n)
+              if self.transport_mode == 'low_rank':
+                  n = param.numel()
+                  r = min(self.low_rank_rank, n)
 
-              self.low_rank_U[key] = nn.Parameter(
-                  torch.randn(n, r, device=param.device, dtype=param.dtype) * self.low_rank_init_scale
-              )
-              self.low_rank_V[key] = nn.Parameter(
-                  torch.randn(n, r, device=param.device, dtype=param.dtype) * self.low_rank_init_scale
-              )
+                  self.low_rank_U[key] = nn.Parameter(
+                      torch.randn(n, r, device=param.device, dtype=param.dtype) * self.low_rank_init_scale
+                  )
+                  self.low_rank_V[key] = nn.Parameter(
+                      torch.randn(n, r, device=param.device, dtype=param.dtype) * self.low_rank_init_scale
+                  )
 
   def _build_shift_aware_residual_gate(self):
       context_dim = int(self.encoder.get_out_dim())
